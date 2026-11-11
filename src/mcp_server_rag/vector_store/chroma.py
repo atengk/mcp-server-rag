@@ -8,7 +8,7 @@
 """
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import chromadb
 from chromadb.api import ClientAPI
@@ -51,6 +51,46 @@ class ChromaVectorStoreAdapter:
         coll_name = self._collection_name(name)
         try:
             self._client.delete_collection(name=coll_name)
+        except Exception:
+            pass
+
+    def add_chunks(
+        self,
+        kb_name: str,
+        chunk_ids: list[str],
+        texts: list[str],
+        embeddings: list[list[float]],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """向知识库批量写入向量切片。"""
+        if not chunk_ids:
+            return
+        coll_name = self._collection_name(kb_name)
+        collection = self._client.get_or_create_collection(name=coll_name)
+        safe_metadatas = []
+        for m in metadatas:
+            safe_m = {}
+            for k, v in m.items():
+                if isinstance(v, (str, int, float, bool)):
+                    safe_m[k] = v
+                else:
+                    safe_m[k] = str(v)
+            safe_metadatas.append(safe_m)
+        collection.add(
+            ids=chunk_ids,
+            documents=texts,
+            embeddings=cast(Any, embeddings),
+            metadatas=cast(Any, safe_metadatas),
+        )
+
+    def delete_chunks(self, kb_name: str, chunk_ids: list[str]) -> None:
+        """从知识库中删除指定切片 ID 列表。"""
+        if not chunk_ids:
+            return
+        coll_name = self._collection_name(kb_name)
+        try:
+            collection = self._client.get_collection(name=coll_name)
+            collection.delete(ids=chunk_ids)
         except Exception:
             pass
 

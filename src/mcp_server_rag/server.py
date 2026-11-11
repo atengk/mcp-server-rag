@@ -7,6 +7,7 @@ FastMCP 服务主实现模块。
 @since 2026-11-11
 """
 
+import hashlib
 import re
 import shutil
 from typing import Any
@@ -14,7 +15,9 @@ from typing import Any
 from mcp.server import MCPServer
 
 from mcp_server_rag.config import get_settings
+from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalog
+from mcp_server_rag.splitter import recursive_split_text
 from mcp_server_rag.vector_store.chroma import ChromaVectorStoreAdapter
 
 # 兼容 FastMCP 类型别名
@@ -227,6 +230,124 @@ def rag_doctor() -> dict[str, Any]:
         "read_only": settings.read_only,
         "knowledge_bases_count": kb_count,
         "documents_count": doc_count,
+    }
+
+
+@mcp.tool()
+def rag_index_text(
+    kb_name: str,
+    text: str,
+    title: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """对单段纯文本内容进行切片、计算高维向量嵌入并持久化索引到指定知识库中。
+
+    支持基于 SHA-256 内容指纹校验的幂等更新：
+    - 若相同 title 的文档内容未变动，秒级跳过；
+    - 若内容发生修改，原子删除旧切片并插入新切片。
+
+    Args:
+        kb_name: 目标知识库名称
+        text: 待索引的正文纯文本内容
+        title: 文档标题或唯一标识（在知识库中作为 doc_id）
+        metadata: 可选的附加结构化元数据（标签、分类、作者等）
+
+    Returns:
+        dict[str, Any]: 索引执行结果状态字典
+    """
+    if not text or not text.strip():
+        return {"success": False, "message": "正文内容不能为空"}
+    if not title or not title.strip():
+        return {"success": False, "message": "文档标题 (title) 不能为空"}
+
+    settings = get_settings()
+    catalog, vector_store = _get_services()
+
+    # 1. 校验知识库是否存在
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return {
+            "success": False,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    doc_id = title.strip()
+    raw_text = text.strip()
+    content_hash = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+
+    # 2. 幂等指纹比对
+    existing = catalog.get_document_by_title(kb_name, doc_id)
+    if existing and existing["content_hash"] == content_hash:
+        return {
+            "success": True,
+            "status": "skipped",
+            "doc_id": doc_id,
+            "chunk_count": existing["chunk_count"],
+            "content_hash": content_hash,
+            "message": (
+                f"Document '{doc_id}' content unchanged, skipped indexing (内容未变动，已跳过)"
+            ),
+        }
+
+    # 3. 若为更新，先清理旧切片
+    status = "indexed"
+    if existing:
+        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
+        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+        status = "updated"
+
+    # 4. 递归切片
+    chunks = recursive_split_text(
+        raw_text,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    )
+    if not chunks:
+        chunks = [raw_text]
+
+    # 5. 计算嵌入向量
+    chunk_ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
+    embedding_provider = get_embedding_provider(settings)
+    embeddings = embedding_provider.embed_texts(chunks)
+
+    # 6. 构造元数据并写入向量存储
+    user_metadata = metadata or {}
+    metadatas = [
+        {
+            **user_metadata,
+            "doc_id": doc_id,
+            "title": title,
+            "kb_name": kb_name,
+            "chunk_index": i,
+        }
+        for i in range(len(chunks))
+    ]
+    vector_store.add_chunks(
+        kb_name=kb_name,
+        chunk_ids=chunk_ids,
+        texts=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+
+    # 7. 写入元数据目录
+    catalog.register_document_and_chunks(
+        kb_name=kb_name,
+        doc_id=doc_id,
+        title=title,
+        content_hash=content_hash,
+        source_uri="",
+        chunk_ids=chunk_ids,
+        file_size=len(raw_text.encode("utf-8")),
+    )
+
+    return {
+        "success": True,
+        "status": status,
+        "doc_id": doc_id,
+        "chunk_count": len(chunks),
+        "content_hash": content_hash,
+        "message": f"Document '{title}' successfully {status}",
     }
 
 

@@ -163,6 +163,120 @@ class MetadataCatalog:
             conn.commit()
             return True
 
+    def get_document_by_title(self, kb_name: str, title: str) -> dict[str, Any] | None:
+        """根据知识库名称与文档标题查找文档记录。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, kb_name, title, content_hash, source_uri, chunk_count, file_size,
+                       created_at, updated_at
+                FROM documents
+                WHERE kb_name = ? AND title = ?
+                """,
+                (kb_name, title),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_document_by_id(self, kb_name: str, doc_id: str) -> dict[str, Any] | None:
+        """根据文档唯一 ID 查找文档记录。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, kb_name, title, content_hash, source_uri, chunk_count, file_size,
+                       created_at, updated_at
+                FROM documents
+                WHERE kb_name = ? AND id = ?
+                """,
+                (kb_name, doc_id),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def delete_document(self, kb_name: str, doc_id: str) -> list[str]:
+        """删除指定文档及其切片记录，返回被删除的切片 ID 列表。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id FROM chunks WHERE kb_name = ? AND doc_id = ?",
+                (kb_name, doc_id),
+            )
+            chunk_ids = [str(row[0]) for row in cursor.fetchall()]
+
+            cursor.execute(
+                "DELETE FROM chunks WHERE kb_name = ? AND doc_id = ?",
+                (kb_name, doc_id),
+            )
+            cursor.execute(
+                "DELETE FROM documents WHERE kb_name = ? AND id = ?",
+                (kb_name, doc_id),
+            )
+            now = datetime.now(timezone.utc).isoformat()
+            cursor.execute(
+                "UPDATE knowledge_bases SET updated_at = ? WHERE name = ?",
+                (now, kb_name),
+            )
+            conn.commit()
+            return chunk_ids
+
+    def register_document_and_chunks(
+        self,
+        kb_name: str,
+        doc_id: str,
+        title: str,
+        content_hash: str,
+        source_uri: str,
+        chunk_ids: list[str],
+        file_size: int,
+    ) -> None:
+        """原子注册文档与其切片记录。"""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            # 插入或更新文档记录
+            cursor.execute(
+                """
+                INSERT INTO documents (
+                    id, kb_name, title, content_hash, source_uri,
+                    chunk_count, file_size, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    content_hash = excluded.content_hash,
+                    chunk_count = excluded.chunk_count,
+                    file_size = excluded.file_size,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    doc_id,
+                    kb_name,
+                    title,
+                    content_hash,
+                    source_uri,
+                    len(chunk_ids),
+                    file_size,
+                    now,
+                    now,
+                ),
+            )
+            # 插入切片记录
+            for idx, c_id in enumerate(chunk_ids):
+                cursor.execute(
+                    """
+                    INSERT INTO chunks (id, kb_name, doc_id, chunk_index, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET created_at = excluded.created_at
+                    """,
+                    (c_id, kb_name, doc_id, idx, now),
+                )
+            cursor.execute(
+                "UPDATE knowledge_bases SET updated_at = ? WHERE name = ?",
+                (now, kb_name),
+            )
+            conn.commit()
+
     def count_kbs(self) -> int:
         """统计知识库总数。"""
         with self._get_connection() as conn:

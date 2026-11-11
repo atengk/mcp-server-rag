@@ -25,6 +25,21 @@ class VectorStoreAdapter(Protocol):
         """物理删除指定知识库的向量集合或分区。"""
         ...
 
+    def add_chunks(
+        self,
+        kb_name: str,
+        chunk_ids: list[str],
+        texts: list[str],
+        embeddings: list[list[float]],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """向知识库批量写入向量切片。"""
+        ...
+
+    def delete_chunks(self, kb_name: str, chunk_ids: list[str]) -> None:
+        """从知识库中删除指定切片 ID 列表。"""
+        ...
+
     def count(self, name: str) -> int:
         """获取指定知识库的向量总数。"""
         ...
