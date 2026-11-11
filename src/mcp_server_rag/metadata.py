@@ -151,6 +151,17 @@ class MetadataCatalog:
             conn.commit()
             return True
 
+    def update_kb_embedding_model(self, name: str, embedding_model: str) -> None:
+        """更新知识库绑定的嵌入模型标识。"""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE knowledge_bases SET embedding_model = ?, updated_at = ? WHERE name = ?",
+                (embedding_model, now, name),
+            )
+            conn.commit()
+
     def delete_kb(self, name: str) -> bool:
         """物理删除指定知识库及其关联数据。"""
         if not self.get_kb(name):

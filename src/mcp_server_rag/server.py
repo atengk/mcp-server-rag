@@ -8,6 +8,7 @@ FastMCP 服务主实现模块。
 """
 
 import hashlib
+import logging
 import re
 import shutil
 from pathlib import Path
@@ -30,6 +31,8 @@ from mcp_server_rag.vector_store import VectorStoreAdapter, get_vector_store
 # 兼容 FastMCP 类型别名
 FastMCP = MCPServer
 
+logger = logging.getLogger(__name__)
+
 READ_ONLY_BLOCK_MSG: str = (
     "只读模式已启用，拒绝执行写操作 (Write operations disabled in read-only mode)"
 )
@@ -50,6 +53,40 @@ def _validate_kb_name(name: str) -> tuple[bool, str]:
     if not re.match(r"^[a-zA-Z0-9_\-]+$", name):
         return False, "知识库名称仅支持英文字母、数字、下划线 (_) 与连字符 (-)"
     return True, ""
+
+
+def _validate_kb_for_write(
+    catalog: MetadataCatalog,
+    kb_name: str,
+    settings: Settings,
+) -> dict[str, Any] | None:
+    """校验目标知识库存在性及运行时 Embedding 模型一致性，防止跨模型向量污染。"""
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return {
+            "success": False,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    kb_model = str(kb.get("embedding_model") or "").strip()
+    current_model = settings.embedding_model.strip()
+    if not kb_model or kb_model == current_model:
+        return None
+
+    has_history = (int(kb.get("document_count") or 0) > 0) or (int(kb.get("chunk_count") or 0) > 0)
+    if has_history:
+        return {
+            "success": False,
+            "message": (
+                f"知识库 '{kb_name}' 已绑定模型 '{kb_model}' 并包含历史数据，"
+                f"与当前运行时模型 '{current_model}' 不一致，禁止跨模型混合写入以防向量空间污染；"
+                "请切回原模型或新建知识库。"
+            ),
+        }
+
+    # 空知识库允许随当前运行时模型更新绑定
+    catalog.update_kb_embedding_model(kb_name, current_model)
+    return None
 
 
 def health_check() -> dict[str, str]:
@@ -98,7 +135,22 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
             "message": f"Knowledge base '{name}' already exists (知识库已存在)",
         }
 
-    # 1. 在 SQLite 中注册知识库元数据
+    # 1. 获取实时向量维度（供强 Schema 向量引擎初始化物理集合）
+    target_dim: int | None = settings.embedding_dimension
+    if target_dim is None:
+        try:
+            target_dim = get_embedding_provider(settings).dimension
+        except Exception as exc:
+            logger.warning("初始化知识库 '%s' 时探测 Embedding 维度失败: %s", name, exc)
+            if vector_store.requires_dimension:
+                return {
+                    "success": False,
+                    "name": name,
+                    "message": f"无法初始化向量存储集合：探测 Embedding 维度失败 ({exc})",
+                }
+            target_dim = None
+
+    # 2. 在 SQLite 中注册知识库元数据
     created = catalog.create_kb(
         name=name,
         description=description,
@@ -111,8 +163,8 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
             "message": f"Failed to register knowledge base '{name}' in metadata catalog",
         }
 
-    # 2. 在向量存储中初始化物理集合
-    vector_store.create_kb(name)
+    # 3. 在向量存储中初始化物理集合
+    vector_store.create_kb(name, dimension=target_dim)
 
     return {
         "success": True,
@@ -309,9 +361,22 @@ def rag_doctor() -> dict[str, Any]:
     kb_count = catalog.count_kbs()
     doc_count = catalog.count_documents()
 
-    overall_status = "healthy" if (sqlite_ok and vector_store_ok) else "degraded"
+    embedding_dimension: int | None = None
+    embedding_status = "ok"
+    embedding_error: str | None = None
+    try:
+        provider = get_embedding_provider(settings)
+        embedding_dimension = provider.dimension
+    except Exception as exc:
+        logger.warning("rag_doctor 探测 Embedding 提供方失败: %s", exc)
+        embedding_status = "error"
+        embedding_error = str(exc)
 
-    return {
+    overall_status = (
+        "healthy" if (sqlite_ok and vector_store_ok and embedding_status == "ok") else "degraded"
+    )
+
+    report: dict[str, Any] = {
         "status": overall_status,
         "data_dir": str(settings.data_dir),
         "data_dir_size_bytes": disk_usage_bytes,
@@ -321,10 +386,15 @@ def rag_doctor() -> dict[str, Any]:
         "metadata_catalog_status": "ok" if sqlite_ok else "error",
         "embedding_provider": settings.embedding_provider,
         "embedding_model": settings.embedding_model,
+        "embedding_dimension": embedding_dimension,
+        "embedding_status": embedding_status,
         "read_only": settings.read_only,
         "knowledge_bases_count": kb_count,
         "documents_count": doc_count,
     }
+    if embedding_error:
+        report["embedding_error"] = embedding_error
+    return report
 
 
 def rag_index_text(
@@ -363,12 +433,9 @@ def rag_index_text(
     catalog, vector_store = _get_services()
 
     # 1. 校验知识库是否存在
-    kb = catalog.get_kb(kb_name)
-    if not kb:
-        return {
-            "success": False,
-            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
-        }
+    err = _validate_kb_for_write(catalog, kb_name, settings)
+    if err:
+        return err
 
     doc_id = title.strip()
     raw_text = text.strip()
@@ -495,12 +562,9 @@ def rag_index_file(
     catalog, vector_store = _get_services()
 
     # 1. 校验知识库是否存在
-    kb = catalog.get_kb(kb_name)
-    if not kb:
-        return {
-            "success": False,
-            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
-        }
+    err = _validate_kb_for_write(catalog, kb_name, settings)
+    if err:
+        return err
 
     doc_id = str(path)
     title = path.name
@@ -668,12 +732,9 @@ def rag_index_directory(
         }
 
     catalog, _ = _get_services()
-    kb = catalog.get_kb(kb_name)
-    if not kb:
-        return {
-            "success": False,
-            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
-        }
+    err = _validate_kb_for_write(catalog, kb_name, settings)
+    if err:
+        return err
 
     # 1. 扫描候选文件
     candidate_files: list[Path] = []
@@ -792,12 +853,9 @@ def rag_index_url(
 
     settings = get_settings()
     catalog, vector_store = _get_services()
-    kb = catalog.get_kb(kb_name)
-    if not kb:
-        return {
-            "success": False,
-            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
-        }
+    err = _validate_kb_for_write(catalog, kb_name, settings)
+    if err:
+        return err
 
     headers = {
         "User-Agent": (

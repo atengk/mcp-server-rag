@@ -16,6 +16,11 @@ class MilvusVectorStoreAdapter:
     DEFAULT_COLLECTION: str = "mcp_rag_chunks"
     DEFAULT_DIMENSION: int = 512
 
+    @property
+    def requires_dimension(self) -> bool:
+        """Milvus 建表必须预先确定向量维度。"""
+        return True
+
     def __init__(
         self,
         uri: str = "http://localhost:19530",
@@ -61,9 +66,9 @@ class MilvusVectorStoreAdapter:
                 auto_id=False,
             )
 
-    def create_kb(self, name: str) -> None:
-        """为知识库创建底层向量存储（统一物理集合，校验或初始化统一表）。"""
-        self._ensure_collection()
+    def create_kb(self, name: str, dimension: int | None = None) -> None:
+        """为知识库创建底层向量存储（统一物理集合，按实时探测维度初始化）。"""
+        self._ensure_collection(dim=dimension)
 
     def clear_kb(self, name: str) -> None:
         """清空指定知识库的所有向量数据。"""

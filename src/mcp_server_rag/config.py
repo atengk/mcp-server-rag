@@ -15,14 +15,20 @@ from pydantic import BaseModel, Field
 
 def _parse_int_env(key: str, default: int, min_val: int = 1) -> int:
     """安全解析整型环境变量，若未提供或格式非法则安全回退到默认值。"""
+    val = _parse_optional_int_env(key, min_val=min_val)
+    return val if val is not None else default
+
+
+def _parse_optional_int_env(key: str, min_val: int = 1) -> int | None:
+    """安全解析可选整型环境变量，未设置或非法时返回 None。"""
     raw = os.getenv(key)
     if raw is None or not raw.strip():
-        return default
+        return None
     try:
         val = int(raw.strip())
-        return val if val >= min_val else default
+        return val if val >= min_val else None
     except ValueError:
-        return default
+        return None
 
 
 def _parse_bool_env(key: str, default: bool = False) -> bool:
@@ -51,12 +57,24 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("MCP_RAG_VECTOR_STORE", "chromadb").strip().lower()
     )
     embedding_provider: str = Field(
-        default_factory=lambda: os.getenv("MCP_RAG_EMBEDDING_PROVIDER", "fastembed").strip().lower()
+        default_factory=lambda: (
+            os.getenv("MCP_RAG_EMBEDDING_PROVIDER", "fastembed").strip().lower() or "fastembed"
+        )
+    )
+    embedding_base_url: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_EMBEDDING_BASE_URL", "").strip()
+    )
+    embedding_api_key: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_EMBEDDING_API_KEY", "").strip()
     )
     embedding_model: str = Field(
-        default_factory=lambda: os.getenv(
-            "MCP_RAG_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5"
-        ).strip()
+        default_factory=lambda: (
+            os.getenv("MCP_RAG_EMBEDDING_MODEL", "BAAI/bge-small-zh-v1.5").strip()
+            or "BAAI/bge-small-zh-v1.5"
+        )
+    )
+    embedding_dimension: int | None = Field(
+        default_factory=lambda: _parse_optional_int_env("MCP_RAG_EMBEDDING_DIMENSION", min_val=1)
     )
     read_only: bool = Field(default_factory=lambda: _parse_bool_env("MCP_RAG_READ_ONLY", False))
     chunk_size: int = Field(

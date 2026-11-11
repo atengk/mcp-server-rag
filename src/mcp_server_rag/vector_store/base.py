@@ -14,8 +14,18 @@ from typing import Any, Protocol, runtime_checkable
 class VectorStoreAdapter(Protocol):
     """向量存储适配器协议接口。"""
 
-    def create_kb(self, name: str) -> None:
-        """为知识库创建底层向量集合或分区。"""
+    @property
+    def requires_dimension(self) -> bool:
+        """指示初始化建库集合时是否强依赖已知的向量维度。"""
+        ...
+
+    def create_kb(self, name: str, dimension: int | None = None) -> None:
+        """为知识库创建底层向量集合或分区。
+
+        Args:
+            name: 知识库名称
+            dimension: 可选的初始向量维度，由 Embedding 提供方自动探测注入
+        """
         ...
 
     def clear_kb(self, name: str) -> None:

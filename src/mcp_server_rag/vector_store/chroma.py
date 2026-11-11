@@ -17,6 +17,11 @@ from chromadb.api import ClientAPI
 class ChromaVectorStoreAdapter:
     """ChromaDB 本地持久化向量存储适配器。"""
 
+    @property
+    def requires_dimension(self) -> bool:
+        """ChromaDB 按首批写入向量动态推断维度，建空库时不强依赖预设维度。"""
+        return False
+
     def __init__(self, data_dir: Path) -> None:
         self.chroma_dir = data_dir / "chroma"
         self.chroma_dir.mkdir(parents=True, exist_ok=True)
@@ -32,8 +37,9 @@ class ChromaVectorStoreAdapter:
         clean_name = "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in kb_name)
         return f"mcp_kb_{clean_name}"[:63]
 
-    def create_kb(self, name: str) -> None:
-        """创建知识库对应集合。"""
+    def create_kb(self, name: str, dimension: int | None = None) -> None:
+        """创建知识库对应集合（ChromaDB 按首批写入向量自适应维度）。"""
+        _ = dimension
         coll_name = self._collection_name(name)
         self._client.get_or_create_collection(
             name=coll_name,
