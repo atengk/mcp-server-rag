@@ -140,6 +140,26 @@ class Settings(BaseModel):
             "MCP_RAG_REMOTE_IMAGE_MAX_BYTES", 10 * 1024 * 1024, min_val=1024
         )
     )
+    rerank_enabled: bool = Field(
+        default_factory=lambda: _parse_bool_env("MCP_RAG_RERANK_ENABLED", False)
+    )
+    rerank_provider: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_RERANK_PROVIDER", "fastembed").strip().lower()
+    )
+    rerank_model: str = Field(
+        default_factory=lambda: (
+            (os.getenv("MCP_RAG_RERANK_MODEL") or "").strip() or "BAAI/bge-reranker-base"
+        )
+    )
+    rerank_base_url: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_RERANK_BASE_URL", "").strip()
+    )
+    rerank_api_key: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_RERANK_API_KEY", "").strip()
+    )
+    rerank_timeout_seconds: int = Field(
+        default_factory=lambda: _parse_int_env("MCP_RAG_RERANK_TIMEOUT_SECONDS", 30, min_val=1)
+    )
 
     def resolved_database_url(self) -> str:
         """解析最终生效的数据库连接 DSN。

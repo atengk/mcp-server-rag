@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Final
 
 from mcp_server_rag.metadata.base import MetadataCatalogAdapter
+from mcp_server_rag.reranker.base import RerankerProvider
 from mcp_server_rag.vector_store.base import VectorStoreAdapter
 
 # RRF 排名融合平滑常数（行业通用经验值 60）
@@ -41,6 +42,7 @@ class HybridSearchOptions:
     metadata_filter: dict[str, Any] | None = None
     where: dict[str, Any] | None = None
     where_document: dict[str, Any] | None = None
+    reranker: RerankerProvider | None = None
 
 
 @dataclass
@@ -264,5 +266,26 @@ def execute_hybrid_search(
         fts_candidates=fts_candidates,
         has_metadata_filter=has_meta_filter,
     )
+
+    if cfg.reranker is not None and fused:
+        # 对 RRF 初筛出的扩大候选集进行高精度交叉重排打分
+        pool = fused[:candidate_top_k]
+        pool_texts = [str(hit.get("text") or "") for hit in pool]
+        rerank_results = cfg.reranker.rerank(clean_query, pool_texts)
+
+        reranked_pool: list[dict[str, Any]] = []
+        for res in rerank_results:
+            if 0 <= res.index < len(pool):
+                hit = dict(pool[res.index])
+                hit["score"] = round(float(res.score), 4)
+                hit_meta = dict(hit.get("metadata") or {})
+                hit_meta["rerank_score"] = round(float(res.score), 4)
+                hit_meta["rerank_model"] = cfg.reranker.model_name
+                hit["metadata"] = hit_meta
+                reranked_pool.append(hit)
+
+        filtered = [hit for hit in reranked_pool if float(hit.get("score") or 0.0) >= cfg.threshold]
+        return filtered[: cfg.top_k]
+
     filtered = [hit for hit in fused if float(hit.get("score") or 0.0) >= cfg.threshold]
     return filtered[: cfg.top_k]

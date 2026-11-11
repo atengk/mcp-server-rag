@@ -51,6 +51,7 @@ from mcp_server_rag.parsers import (
     extract_images_from_text,
     split_markdown,
 )
+from mcp_server_rag.reranker import RerankerProvider, get_reranker_provider
 from mcp_server_rag.splitter import recursive_split_text
 from mcp_server_rag.vector_store import VectorStoreAdapter, get_vector_store
 
@@ -593,6 +594,9 @@ def rag_doctor() -> dict[str, Any]:
         "storage_type": settings.storage_type,
         "archive_remote_images": settings.archive_remote_images,
         "read_only": settings.read_only,
+        "rerank_enabled": settings.rerank_enabled,
+        "rerank_provider": settings.rerank_provider,
+        "rerank_model": settings.rerank_model,
         "knowledge_bases_count": kb_count,
         "documents_count": doc_count,
     }
@@ -1592,7 +1596,11 @@ def rag_search(
     embedding_provider = get_embedding_provider(settings)
     query_vector = embedding_provider.embed_query(query.strip())
 
-    # 4. 执行向量检索 + 原生数据库 FTS 倒排双路召回与 RRF 融合重排
+    # 4. 执行向量检索 + 原生数据库 FTS 倒排双路召回与 RRF 融合重排（支持按需二次交叉重排）
+    reranker: RerankerProvider | None = None
+    if settings.rerank_enabled:
+        reranker = get_reranker_provider(settings)
+
     fused_hits = execute_hybrid_search(
         catalog=catalog,
         vector_store=vector_store,
@@ -1606,6 +1614,7 @@ def rag_search(
             metadata_filter=metadata_filter,
             where=where,
             where_document=where_document,
+            reranker=reranker,
         ),
     )
 
