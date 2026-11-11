@@ -15,6 +15,7 @@
 @since 2026-11-11
 """
 
+import importlib.util
 import io
 import os
 import shutil
@@ -461,39 +462,42 @@ async def test_s3_storage_mode_uploads_markdown_and_docx_images_rewrites_urls_an
     assert md_hits[0]["metadata"]["images"] == [expected_md_url]
     assert "rag://assets/" not in md_hits[0]["text"]
 
-    # 2. .docx 内嵌图片上传 S3 并转写切片与 metadata.images 为 HTTPS 直链
-    docx_doc = md_dir / "handbook.docx"
-    docx_png = _make_png_bytes(180, 140, color=(90, 40, 140))
-    _build_synthetic_docx_with_image(
-        docx_doc,
-        heading="多节点容灾方案",
-        body_text="主备切换与流量摘除核心机制如下：",
-        image_bytes=docx_png,
-        alt_text="双活容灾架构图",
-    )
-    docx_res = rag_index_file(kb_name="s3_kb", file_path=str(docx_doc))
-    assert docx_res["success"] is True
+    # 2. .docx 内嵌图片上传 S3 并转写切片与 metadata.images 为 HTTPS 直链（可选依赖检测）
+    has_docx = importlib.util.find_spec("docx") is not None
+    expected_docx_key = ""
+    if has_docx:
+        docx_doc = md_dir / "handbook.docx"
+        docx_png = _make_png_bytes(180, 140, color=(90, 40, 140))
+        _build_synthetic_docx_with_image(
+            docx_doc,
+            heading="多节点容灾方案",
+            body_text="主备切换与流量摘除核心机制如下：",
+            image_bytes=docx_png,
+            alt_text="双活容灾架构图",
+        )
+        docx_res = rag_index_file(kb_name="s3_kb", file_path=str(docx_doc))
+        assert docx_res["success"] is True
 
-    docx_doc_key = make_asset_doc_key(str(docx_doc.resolve()))
-    expected_docx_key = f"team-assets/s3_kb/{docx_doc_key}/image1.png"
-    expected_docx_url = f"https://cdn.example.com/corp-rag/{expected_docx_key}"
-    assert ("corp-rag", expected_docx_key) in fake_s3.objects
+        docx_doc_key = make_asset_doc_key(str(docx_doc.resolve()))
+        expected_docx_key = f"team-assets/s3_kb/{docx_doc_key}/image1.png"
+        expected_docx_url = f"https://cdn.example.com/corp-rag/{expected_docx_key}"
+        assert ("corp-rag", expected_docx_key) in fake_s3.objects
 
-    docx_hits = rag_search(kb_name="s3_kb", query="双活容灾架构图", top_k=3)
-    assert len(docx_hits) >= 1
-    assert expected_docx_url in docx_hits[0]["text"]
-    assert docx_hits[0]["metadata"]["images"] == [expected_docx_url]
+        docx_hits = rag_search(kb_name="s3_kb", query="双活容灾架构图", top_k=3)
+        assert len(docx_hits) >= 1
+        assert expected_docx_url in docx_hits[0]["text"]
+        assert docx_hits[0]["metadata"]["images"] == [expected_docx_url]
 
     # 3. FastMCP Resource 端点在 S3 模式下同样可穿透读取二进制内容；缺少 [s3] 依赖返回 ResourceError
     server = create_server(get_settings())
-    docx_uri = f"rag://assets/s3_kb/{docx_doc_key}/image1.png"
-    docx_res_bytes = list(await server.read_resource(docx_uri))
-    assert docx_res_bytes[0].content == docx_png
-    assert docx_res_bytes[0].mime_type == "image/png"
+    test_resource_uri = f"rag://assets/s3_kb/{md_doc_key}/deploy.png"
+    read_res_bytes = list(await server.read_resource(test_resource_uri))
+    assert read_res_bytes[0].content == rel_png
+    assert read_res_bytes[0].mime_type == "image/png"
 
     monkeypatch.setitem(sys.modules, "boto3", None)
     with pytest.raises(ResourceError) as missing_s3_err:
-        await server.read_resource(docx_uri)
+        await server.read_resource(test_resource_uri)
     assert "[s3]" in str(missing_s3_err.value)
     _install_fake_boto3(monkeypatch, fake_s3)
 
@@ -523,11 +527,13 @@ async def test_s3_storage_mode_uploads_markdown_and_docx_images_rewrites_urls_an
     del_res = rag_delete_document(kb_name="s3_kb", doc_id=str(md_doc.resolve()))
     assert del_res["success"] is True
     assert ("corp-rag", expected_md_key) not in fake_s3.objects
-    assert ("corp-rag", expected_docx_key) in fake_s3.objects
+    if has_docx:
+        assert ("corp-rag", expected_docx_key) in fake_s3.objects
 
     clear_res = rag_clear_kb(name="s3_kb")
     assert clear_res["success"] is True
-    assert ("corp-rag", expected_docx_key) not in fake_s3.objects
+    if has_docx:
+        assert ("corp-rag", expected_docx_key) not in fake_s3.objects
     assert rag_delete_kb(name="s3_kb")["success"] is True
 
 
