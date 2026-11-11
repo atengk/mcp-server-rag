@@ -11,6 +11,7 @@ import hashlib
 import logging
 import re
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +22,10 @@ from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalogAdapter, get_metadata_catalog
 from mcp_server_rag.parsers import (
+    build_embedding_text,
     dispatch_and_split,
     extract_html_content,
+    extract_images_from_text,
     split_markdown,
 )
 from mcp_server_rag.splitter import recursive_split_text
@@ -36,6 +39,7 @@ logger = logging.getLogger(__name__)
 READ_ONLY_BLOCK_MSG: str = (
     "只读模式已启用，拒绝执行写操作 (Write operations disabled in read-only mode)"
 )
+MAX_EXPAND_CONTEXT: int = 5
 
 
 def _get_services() -> tuple[MetadataCatalogAdapter, VectorStoreAdapter]:
@@ -98,6 +102,67 @@ def _validate_kb_for_write(
         embedding_dimension=int(target_dim or 0),
     )
     return None
+
+
+@dataclass(frozen=True)
+class _DocumentIndexSpec:
+    """文档切片索引与双存储持久化入参载荷。"""
+
+    kb_name: str
+    doc_id: str
+    title: str
+    content_hash: str
+    source_uri: str
+    file_size: int
+    chunks: list[str]
+    chunk_ids: list[str]
+    user_metadata: dict[str, Any] | None = None
+    extra_metadata: dict[str, Any] | None = None
+
+
+def _persist_indexed_document(
+    settings: Settings,
+    catalog: MetadataCatalogAdapter,
+    vector_store: VectorStoreAdapter,
+    doc: _DocumentIndexSpec,
+) -> None:
+    """统一执行 Alt 语义向量构建、图片清单提取、向量写入与元数据链表持久化。"""
+    embedding_provider = get_embedding_provider(settings)
+    embedding_texts = [build_embedding_text(chunk) for chunk in doc.chunks]
+    embeddings = embedding_provider.embed_texts(embedding_texts)
+    chunk_images = [extract_images_from_text(chunk) for chunk in doc.chunks]
+
+    base_user_meta = doc.user_metadata or {}
+    base_extra_meta = doc.extra_metadata or {}
+    metadatas = [
+        {
+            **base_user_meta,
+            **base_extra_meta,
+            "doc_id": doc.doc_id,
+            "title": doc.title,
+            "kb_name": doc.kb_name,
+            "chunk_index": i,
+        }
+        for i in range(len(doc.chunks))
+    ]
+    vector_store.add_chunks(
+        kb_name=doc.kb_name,
+        chunk_ids=doc.chunk_ids,
+        texts=doc.chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+    catalog.register_document_and_chunks(
+        kb_name=doc.kb_name,
+        doc_id=doc.doc_id,
+        title=doc.title,
+        content_hash=doc.content_hash,
+        source_uri=doc.source_uri,
+        chunk_ids=doc.chunk_ids,
+        file_size=doc.file_size,
+        chunk_contents=doc.chunks,
+        chunk_images=chunk_images,
+    )
 
 
 def health_check() -> dict[str, str]:
@@ -503,41 +568,23 @@ def rag_index_text(
     if not chunks:
         chunks = [raw_text]
 
-    # 5. 计算嵌入向量
+    # 5. 计算语义向量并协同持久化至向量库与元数据目录
     chunk_ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-    embedding_provider = get_embedding_provider(settings)
-    embeddings = embedding_provider.embed_texts(chunks)
-
-    # 6. 构造元数据并写入向量存储
-    user_metadata = metadata or {}
-    metadatas = [
-        {
-            **user_metadata,
-            "doc_id": doc_id,
-            "title": title,
-            "kb_name": kb_name,
-            "chunk_index": i,
-        }
-        for i in range(len(chunks))
-    ]
-    vector_store.add_chunks(
-        kb_name=kb_name,
-        chunk_ids=chunk_ids,
-        texts=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-
-    # 7. 写入元数据目录
-    catalog.register_document_and_chunks(
-        kb_name=kb_name,
-        doc_id=doc_id,
-        title=title,
-        content_hash=content_hash,
-        source_uri="",
-        chunk_ids=chunk_ids,
-        file_size=len(raw_text.encode("utf-8")),
-        chunk_contents=chunks,
+    _persist_indexed_document(
+        settings,
+        catalog,
+        vector_store,
+        _DocumentIndexSpec(
+            kb_name=kb_name,
+            doc_id=doc_id,
+            title=title,
+            content_hash=content_hash,
+            source_uri="",
+            file_size=len(raw_text.encode("utf-8")),
+            chunks=chunks,
+            chunk_ids=chunk_ids,
+            user_metadata=metadata,
+        ),
     )
 
     return {
@@ -633,45 +680,29 @@ def rag_index_file(
     if not chunks:
         chunks = [raw_content]
 
-    # 5. 生成全局唯一切片 ID 并计算向量嵌入
+    # 5. 生成全局唯一切片 ID 并协同持久化至向量库与元数据目录
     path_hash = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8]
     chunk_ids = [f"{path.stem}_{path_hash}_{i}" for i in range(len(chunks))]
-    embedding_provider = get_embedding_provider(settings)
-    embeddings = embedding_provider.embed_texts(chunks)
-
-    # 6. 构造元数据并写入向量存储
-    user_metadata = metadata or {}
-    metadatas = [
-        {
-            **user_metadata,
-            "doc_id": doc_id,
-            "title": title,
-            "file_path": str(path),
-            "file_name": path.name,
-            "file_extension": path.suffix.lower(),
-            "kb_name": kb_name,
-            "chunk_index": i,
-        }
-        for i in range(len(chunks))
-    ]
-    vector_store.add_chunks(
-        kb_name=kb_name,
-        chunk_ids=chunk_ids,
-        texts=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-
-    # 7. 写入元数据目录
-    catalog.register_document_and_chunks(
-        kb_name=kb_name,
-        doc_id=doc_id,
-        title=title,
-        content_hash=content_hash,
-        source_uri=str(path),
-        chunk_ids=chunk_ids,
-        file_size=len(raw_content.encode("utf-8")),
-        chunk_contents=chunks,
+    _persist_indexed_document(
+        settings,
+        catalog,
+        vector_store,
+        _DocumentIndexSpec(
+            kb_name=kb_name,
+            doc_id=doc_id,
+            title=title,
+            content_hash=content_hash,
+            source_uri=str(path),
+            file_size=len(raw_content.encode("utf-8")),
+            chunks=chunks,
+            chunk_ids=chunk_ids,
+            user_metadata=metadata,
+            extra_metadata={
+                "file_path": str(path),
+                "file_name": path.name,
+                "file_extension": path.suffix.lower(),
+            },
+        ),
     )
 
     return {
@@ -965,40 +996,26 @@ def rag_index_url(
 
     url_hash = hashlib.md5(clean_url.encode("utf-8")).hexdigest()[:8]
     chunk_ids = [f"url_{url_hash}_{i}" for i in range(len(chunks))]
-    embedding_provider = get_embedding_provider(settings)
-    embeddings = embedding_provider.embed_texts(chunks)
-
-    user_metadata = metadata or {}
-    metadatas = [
-        {
-            **user_metadata,
-            "doc_id": doc_id,
-            "title": title,
-            "url": clean_url,
-            "source_uri": clean_url,
-            "content_type": content_type,
-            "kb_name": kb_name,
-            "chunk_index": i,
-        }
-        for i in range(len(chunks))
-    ]
-    vector_store.add_chunks(
-        kb_name=kb_name,
-        chunk_ids=chunk_ids,
-        texts=chunks,
-        embeddings=embeddings,
-        metadatas=metadatas,
-    )
-
-    catalog.register_document_and_chunks(
-        kb_name=kb_name,
-        doc_id=doc_id,
-        title=title,
-        content_hash=content_hash,
-        source_uri=clean_url,
-        chunk_ids=chunk_ids,
-        file_size=len(text_content.encode("utf-8")),
-        chunk_contents=chunks,
+    _persist_indexed_document(
+        settings,
+        catalog,
+        vector_store,
+        _DocumentIndexSpec(
+            kb_name=kb_name,
+            doc_id=doc_id,
+            title=title,
+            content_hash=content_hash,
+            source_uri=clean_url,
+            file_size=len(text_content.encode("utf-8")),
+            chunks=chunks,
+            chunk_ids=chunk_ids,
+            user_metadata=metadata,
+            extra_metadata={
+                "url": clean_url,
+                "source_uri": clean_url,
+                "content_type": content_type,
+            },
+        ),
     )
 
     return {
@@ -1084,6 +1101,239 @@ def _resolve_target_kbs(
     return [], False
 
 
+def _hydrate_hits_images(
+    catalog: MetadataCatalogAdapter,
+    hits: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """从元数据目录批量回填命中切片的结构化 images URL 列表（无图片恒为空列表 []）。"""
+    if not hits:
+        return hits
+
+    ids_by_kb: dict[str, list[str]] = {}
+    for hit in hits:
+        kb = str(hit.get("kb_name") or "")
+        cid = str(hit.get("chunk_id") or "")
+        if kb and cid:
+            ids_by_kb.setdefault(kb, []).append(cid)
+
+    chunk_map: dict[tuple[str, str], dict[str, Any]] = {}
+    for kb, cids in ids_by_kb.items():
+        for row in catalog.get_chunks_by_ids(kb, cids):
+            chunk_map[(kb, str(row["id"]))] = row
+
+    for hit in hits:
+        kb = str(hit.get("kb_name") or "")
+        cid = str(hit.get("chunk_id") or "")
+        item_meta = hit.setdefault("metadata", {})
+        chunk_row = chunk_map.get((kb, cid))
+        if chunk_row is not None:
+            item_meta["images"] = list(chunk_row.get("images") or [])
+        else:
+            item_meta["images"] = extract_images_from_text(str(hit.get("text") or ""))
+    return hits
+
+
+def _normalize_expand_context(expand_context: int) -> int:
+    """将邻近上下文扩展步数钳位至安全区间 [0, MAX_EXPAND_CONTEXT]。"""
+    return max(0, min(int(expand_context), MAX_EXPAND_CONTEXT))
+
+
+@dataclass
+class _ExpandedCluster:
+    """同文档邻近窗口扩展与重叠合并后的切片聚合簇。"""
+
+    chunk_ids: set[str]
+    seed_hit: dict[str, Any]
+    score: float
+    fallbacks: dict[str, str] = field(default_factory=dict)
+
+
+def _collect_chain(
+    by_id: dict[str, dict[str, Any]],
+    start_node: dict[str, Any],
+    pointer_key: str,
+    window: int,
+    visited: set[str],
+) -> list[dict[str, Any]]:
+    """沿单侧链表指针（prev_chunk_id 或 next_chunk_id）采集带防环保护的邻接节点。"""
+    chain: list[dict[str, Any]] = []
+    curr = start_node
+    for _ in range(window):
+        target_id = str(curr.get(pointer_key) or "")
+        if not target_id or target_id in visited or target_id not in by_id:
+            break
+        visited.add(target_id)
+        node = by_id[target_id]
+        chain.append(node)
+        curr = node
+    return chain
+
+
+def _walk_linked_window(
+    by_id: dict[str, dict[str, Any]],
+    seed_id: str,
+    window: int,
+) -> list[dict[str, Any]]:
+    """沿双向链表指针 prev_chunk_id/next_chunk_id 收集带防环保护的邻接切片窗口。"""
+    seed_node = by_id.get(seed_id)
+    if seed_node is None:
+        return []
+
+    visited: set[str] = {seed_id}
+    prev_chain = _collect_chain(by_id, seed_node, "prev_chunk_id", window, visited)
+    prev_chain.reverse()
+    next_chain = _collect_chain(by_id, seed_node, "next_chunk_id", window, visited)
+    return [*prev_chain, seed_node, *next_chain]
+
+
+def _materialize_cluster(
+    cluster: _ExpandedCluster,
+    by_id: dict[str, dict[str, Any]],
+    pos_by_id: dict[str, int],
+) -> dict[str, Any]:
+    """按文档原始阅读顺序缝合簇内切片文本，并去重聚合关联图片清单。"""
+    ordered_ids = sorted(cluster.chunk_ids, key=lambda cid: pos_by_id.get(cid, 0))
+
+    pieces: list[str] = []
+    merged_images: list[str] = []
+    seen_images: set[str] = set()
+
+    for cid in ordered_ids:
+        row = by_id.get(cid)
+        if row is None:
+            continue
+        piece_text = str(row.get("content") or "").strip()
+        if not piece_text:
+            piece_text = cluster.fallbacks.get(cid, "").strip()
+        if piece_text:
+            pieces.append(piece_text)
+
+        row_images = row.get("images")
+        raw_imgs: list[str] = (
+            [str(u) for u in row_images if u]
+            if isinstance(row_images, list)
+            else extract_images_from_text(piece_text)
+        )
+        for img_url in raw_imgs:
+            if img_url not in seen_images:
+                seen_images.add(img_url)
+                merged_images.append(img_url)
+
+    seed_hit = cluster.seed_hit
+    stitched_text = "\n\n".join(pieces) if pieces else str(seed_hit.get("text") or "")
+    expanded_meta = dict(seed_hit.get("metadata") or {})
+    expanded_meta["images"] = merged_images
+
+    return {
+        **seed_hit,
+        "text": stitched_text,
+        "score": cluster.score,
+        "metadata": expanded_meta,
+    }
+
+
+def _expand_and_deduplicate_hits(
+    catalog: MetadataCatalogAdapter,
+    hits: list[dict[str, Any]],
+    window: int,
+) -> list[dict[str, Any]]:
+    """展开各命中切片的邻近上下文窗口，并融合同文档重叠区间以消除重复文本。"""
+    if window <= 0 or not hits:
+        return hits
+
+    # 1. 预先查询缺少 doc_id 的命中切片，尽量还原文档归属
+    missing_doc_ids_by_kb: dict[str, list[str]] = {}
+    for hit in hits:
+        kb = str(hit.get("kb_name") or "")
+        cid = str(hit.get("chunk_id") or "")
+        meta = hit.get("metadata") or {}
+        if kb and cid and not meta.get("doc_id"):
+            missing_doc_ids_by_kb.setdefault(kb, []).append(cid)
+
+    seed_doc_map: dict[tuple[str, str], str] = {}
+    for kb, cids in missing_doc_ids_by_kb.items():
+        for row in catalog.get_chunks_by_ids(kb, cids):
+            seed_doc_map[(kb, str(row["id"]))] = str(row.get("doc_id") or "")
+
+    # 2. 按 (kb_name, doc_id) 缓存有序文档切片索引
+    doc_cache: dict[tuple[str, str], tuple[dict[str, dict[str, Any]], dict[str, int]]] = {}
+    clusters_by_doc: dict[tuple[str, str], list[_ExpandedCluster]] = {}
+    passthrough_hits: list[dict[str, Any]] = []
+
+    for hit in hits:
+        kb = str(hit.get("kb_name") or "")
+        seed_id = str(hit.get("chunk_id") or "")
+        hit_meta = hit.get("metadata") or {}
+        doc_id = str(hit_meta.get("doc_id") or seed_doc_map.get((kb, seed_id), ""))
+
+        if not kb or not doc_id or not seed_id:
+            passthrough_hits.append(hit)
+            continue
+
+        doc_key = (kb, doc_id)
+        if doc_key not in doc_cache:
+            doc_rows = catalog.get_chunks_by_doc(kb, doc_id)
+            by_id = {str(r["id"]): r for r in doc_rows}
+            pos_by_id = {str(r["id"]): idx for idx, r in enumerate(doc_rows)}
+            doc_cache[doc_key] = (by_id, pos_by_id)
+
+        by_id, _ = doc_cache[doc_key]
+        window_nodes = _walk_linked_window(by_id, seed_id, window)
+        if not window_nodes:
+            passthrough_hits.append(hit)
+            continue
+
+        window_ids = {str(node["id"]) for node in window_nodes}
+        hit_score = float(hit.get("score") or 0.0)
+        hit_text = str(hit.get("text") or "")
+
+        existing = clusters_by_doc.setdefault(doc_key, [])
+        overlapping = [idx for idx, cl in enumerate(existing) if cl.chunk_ids & window_ids]
+
+        if not overlapping:
+            existing.append(
+                _ExpandedCluster(
+                    chunk_ids=set(window_ids),
+                    seed_hit=hit,
+                    score=hit_score,
+                    fallbacks={seed_id: hit_text},
+                )
+            )
+            continue
+
+        # 合并所有与当前窗口重叠的簇，保留最高分种子命中及全部文本兜底
+        merged_cluster = _ExpandedCluster(
+            chunk_ids=set(window_ids),
+            seed_hit=hit,
+            score=hit_score,
+            fallbacks={seed_id: hit_text},
+        )
+        remaining: list[_ExpandedCluster] = []
+        overlap_set = set(overlapping)
+        for idx, cl in enumerate(existing):
+            if idx not in overlap_set:
+                remaining.append(cl)
+                continue
+            merged_cluster.chunk_ids.update(cl.chunk_ids)
+            merged_cluster.fallbacks.update(cl.fallbacks)
+            if cl.score >= merged_cluster.score:
+                merged_cluster.score = cl.score
+                merged_cluster.seed_hit = cl.seed_hit
+
+        remaining.append(merged_cluster)
+        clusters_by_doc[doc_key] = remaining
+
+    # 3. 实体化合并后的文档窗口并维持全局降序排列
+    expanded_results: list[dict[str, Any]] = list(passthrough_hits)
+    for doc_key, clusters in clusters_by_doc.items():
+        by_id, pos_by_id = doc_cache[doc_key]
+        for cluster in clusters:
+            expanded_results.append(_materialize_cluster(cluster, by_id, pos_by_id))
+
+    expanded_results.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    return expanded_results
+
+
 def rag_search(
     kb_name: str | list[str],
     query: str,
@@ -1091,8 +1341,9 @@ def rag_search(
     threshold: float = 0.0,
     keyword: str | None = None,
     metadata_filter: dict[str, Any] | None = None,
+    expand_context: int = 0,
 ) -> list[dict[str, Any]]:
-    """在指定知识库或跨多个知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与元数据过滤。
+    """在指定知识库或跨多个知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与上下文扩展。
 
     Args:
         kb_name: 目标知识库名称，支持单库名称、知识库列表（如 ["docs", "code"]）或 "*" 跨全库召回
@@ -1101,10 +1352,11 @@ def rag_search(
         threshold: 相似度截断阈值，过滤掉低于此分数的切片（范围 0.0 ~ 1.0）
         keyword: 可选的精准关键词，切片正文必须包含此词（大小写无关）
         metadata_filter: 可选的元数据字典过滤条件（如 {"category": "tech"}）
+        expand_context: 邻近上下文窗口扩展步数（默认 0 不展开，允许安全范围 0 ~ 5）
 
     Returns:
         list[dict[str, Any]]: 排序后的相似切片列表，
-            每个切片包含 chunk_id, text, score, metadata, kb_name
+            每个切片包含 chunk_id, text, score, metadata（含结构化 images 列表）, kb_name
     """
     if not query or not query.strip():
         return []
@@ -1161,9 +1413,13 @@ def rag_search(
                     continue
             all_filtered.append(item)
 
-    # 5. 全局综合评分降序重排并截取 Top-K
+    # 5. 全局综合评分降序重排并截取 Top-K，补充结构化图片元数据与按需上下文展开
     all_filtered.sort(key=lambda x: x["score"], reverse=True)
-    return all_filtered[:top_k]
+    top_hits = _hydrate_hits_images(catalog, all_filtered[:top_k])
+    window = _normalize_expand_context(expand_context)
+    if window > 0:
+        return _expand_and_deduplicate_hits(catalog, top_hits, window)
+    return top_hits
 
 
 def rag_query_with_context(
@@ -1173,6 +1429,7 @@ def rag_query_with_context(
     threshold: float = 0.0,
     keyword: str | None = None,
     metadata_filter: dict[str, Any] | None = None,
+    expand_context: int = 0,
 ) -> str:
     """检索知识库相关上下文并组装为带来源引用的 Markdown 增强提示词。
 
@@ -1183,6 +1440,7 @@ def rag_query_with_context(
         threshold: 相似度截断阈值，过滤掉低于此分数的切片
         keyword: 可选的精准关键词
         metadata_filter: 可选的元数据字典过滤条件
+        expand_context: 邻近上下文窗口扩展步数（默认 0 不展开，允许安全范围 0 ~ 5）
 
     Returns:
         str: 组装后的 Markdown 提示词字符串；若无匹配内容则返回未检索到上下文提示
@@ -1194,6 +1452,7 @@ def rag_query_with_context(
         threshold=threshold,
         keyword=keyword,
         metadata_filter=metadata_filter,
+        expand_context=expand_context,
     )
 
     if not chunks:

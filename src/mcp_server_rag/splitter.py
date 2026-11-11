@@ -7,6 +7,8 @@
 @since 2026-11-11
 """
 
+import re
+
 DEFAULT_SEPARATORS: list[str] = [
     "\n\n",
     "\n",
@@ -25,6 +27,31 @@ DEFAULT_SEPARATORS: list[str] = [
     " ",
     "",
 ]
+
+# 匹配 Markdown 图片语法与 HTML <img> 标签，切分时作为原子单元整体保留并暴露命名分组供解析复用
+ATOMIC_IMAGE_PATTERN = re.compile(
+    r"!\[(?P<alt>[^\]\r\n]*)\]\(\s*"
+    r"(?:<(?P<bracket_url>[^>\r\n]+)>|(?P<url>(?:[^()\s]+|\([^()\r\n]*\))+))"
+    r"(?:\s+(?:\"(?P<dq_title>[^\"\r\n]*)\"|'(?P<sq_title>[^'\r\n]*)'))?"
+    r"\s*\)"
+    r"|<img\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _split_atomic_segments(text: str) -> list[tuple[str, bool]]:
+    """按原子图片标签边界拆分文本为 `(片段, 是否原子)` 序列。"""
+    segments: list[tuple[str, bool]] = []
+    last_end = 0
+    for match in ATOMIC_IMAGE_PATTERN.finditer(text):
+        start, end = match.span()
+        if start > last_end:
+            segments.append((text[last_end:start], False))
+        segments.append((match.group(0), True))
+        last_end = end
+    if last_end < len(text):
+        segments.append((text[last_end:], False))
+    return segments
 
 
 def recursive_split_text(
@@ -47,19 +74,21 @@ def recursive_split_text(
     if not text or not text.strip():
         return []
 
-    if len(text) <= chunk_size:
+    effective_chunk_size = max(1, chunk_size)
+    if len(text) <= effective_chunk_size:
         return [text.strip()]
 
     seps = separators or DEFAULT_SEPARATORS
+    step = max(1, effective_chunk_size - chunk_overlap)
 
-    # 1. 递归拆分单元
+    # 1. 递归拆分非原子文本单元
     def _split(s: str, sep_idx: int) -> list[str]:
-        if len(s) <= chunk_size:
+        if len(s) <= effective_chunk_size:
             return [s] if s else []
 
         if sep_idx >= len(seps):
             # 所有分隔符用尽，强制按字符切片
-            return [s[i : i + chunk_size] for i in range(0, len(s), chunk_size - chunk_overlap)]
+            return [s[i : i + effective_chunk_size] for i in range(0, len(s), step)]
 
         sep = seps[sep_idx]
         if sep == "":
@@ -72,13 +101,18 @@ def recursive_split_text(
         result: list[str] = []
         for i, piece in enumerate(splits):
             piece_with_sep = piece if i == len(splits) - 1 else piece + sep
-            if len(piece_with_sep) > chunk_size:
+            if len(piece_with_sep) > effective_chunk_size:
                 result.extend(_split(piece_with_sep, sep_idx + 1))
             elif piece_with_sep:
                 result.append(piece_with_sep)
         return result
 
-    raw_pieces = _split(text, 0)
+    raw_pieces: list[str] = []
+    for seg_text, is_atomic in _split_atomic_segments(text):
+        if is_atomic:
+            raw_pieces.append(seg_text)
+        else:
+            raw_pieces.extend(_split(seg_text, 0))
 
     # 2. 将碎片按 chunk_size 与 chunk_overlap 进行聚合
     chunks: list[str] = []
@@ -87,7 +121,7 @@ def recursive_split_text(
 
     for piece in raw_pieces:
         piece_len = len(piece)
-        if current_len + piece_len > chunk_size and current_chunk:
+        if current_len + piece_len > effective_chunk_size and current_chunk:
             combined = "".join(current_chunk).strip()
             if combined:
                 chunks.append(combined)

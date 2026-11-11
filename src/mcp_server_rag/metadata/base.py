@@ -8,7 +8,46 @@
 @since 2026-11-11
 """
 
+import json
+import logging
 from typing import Any, Protocol, runtime_checkable
+
+logger = logging.getLogger(__name__)
+
+# 分批查询切片 ID 的默认批次上限，规避 SQLite 绑定变量个数限制
+CHUNK_QUERY_BATCH_SIZE: int = 500
+CHUNK_SELECT_COLUMNS: str = (
+    "id, kb_name, doc_id, chunk_index, content, "
+    "prev_chunk_id, next_chunk_id, images_json, created_at"
+)
+
+
+def decode_images_json(raw_images: Any) -> list[str]:
+    """将数据库持久化列 `images_json` 安全解码为字符串 URL 列表。"""
+    if isinstance(raw_images, list):
+        return [str(item) for item in raw_images if item]
+    if not raw_images:
+        return []
+    try:
+        parsed = json.loads(str(raw_images))
+    except (TypeError, ValueError) as exc:
+        logger.warning("解码切片 images_json 失败，已降级为空列表: %s", exc)
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed if item]
+
+
+def deduplicate_chunk_ids(chunk_ids: list[str]) -> list[str]:
+    """保持首次出现顺序对切片 ID 列表进行去重并过滤空串。"""
+    return list(dict.fromkeys(cid for cid in chunk_ids if cid))
+
+
+def normalize_chunk_row(data: dict[str, Any]) -> dict[str, Any]:
+    """将关系型或 SQLite chunks 行转换为含结构化 images 列表的标准切片字典。"""
+    data["chunk_index"] = int(data.get("chunk_index") or 0)
+    data["images"] = decode_images_json(data.pop("images_json", "[]"))
+    return data
 
 
 @runtime_checkable
@@ -192,6 +231,40 @@ class MetadataCatalogAdapter(Protocol):
             doc_id: 所属文档唯一标识符。
             assets: 图片资产字典列表，支持 ``asset_id``、``filename``、``storage_uri``、
                 ``mime_type`` 与 ``byte_size`` 字段。
+        """
+        ...
+
+    def get_chunks_by_ids(
+        self,
+        kb_name: str,
+        chunk_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """按切片 ID 列表批量查询持久化切片正文、双向链表指针与图片清单。
+
+        Args:
+            kb_name: 所属知识库名称。
+            chunk_ids: 待查询的切片 ID 列表。
+
+        Returns:
+            包含 ``id``、``kb_name``、``doc_id``、``chunk_index``、``content``、
+            ``prev_chunk_id``、``next_chunk_id``、``images``（``list[str]``）与 ``created_at``
+            的切片详情列表；无匹配时返回空列表 ``[]``。
+        """
+        ...
+
+    def get_chunks_by_doc(
+        self,
+        kb_name: str,
+        doc_id: str,
+    ) -> list[dict[str, Any]]:
+        """按文档 ID 查询全部有序切片记录（按 ``chunk_index`` 升序）。
+
+        Args:
+            kb_name: 所属知识库名称。
+            doc_id: 文档唯一标识符。
+
+        Returns:
+            按 ``chunk_index`` 升序排列的切片详情列表；无记录时返回空列表 ``[]``。
         """
         ...
 

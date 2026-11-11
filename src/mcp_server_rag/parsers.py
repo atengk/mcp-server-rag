@@ -12,14 +12,32 @@
 """
 
 import csv
+import html
 import io
 import json
+import logging
 import re
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from mcp_server_rag.splitter import recursive_split_text
+from mcp_server_rag.splitter import ATOMIC_IMAGE_PATTERN, recursive_split_text
+
+logger = logging.getLogger(__name__)
+
+# Markdown 分段正文切片的最小可用字符预算，避免超长标题面包屑把切片窗口压缩到负值
+_MIN_MARKDOWN_BODY_CHUNK_SIZE: int = 20
+
+# HTML 属性解析
+_HTML_ATTR_RE = re.compile(
+    r'([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'=<>`]+))'
+)
+
+# 围栏代码块过滤（同时支持 ``` 与 ~~~，提取真实图片列表时跳过示例代码块）
+_FENCED_CODE_BLOCK_RE = re.compile(
+    r"^\s*(?:```[\s\S]*?^\s*```|~~~[\s\S]*?^\s*~~~)",
+    re.MULTILINE,
+)
 
 # 常见源代码文件扩展名映射
 CODE_EXTENSIONS: set[str] = {
@@ -184,7 +202,7 @@ def split_markdown(
                 # 极端超长段落/代码块内部切片
                 sub_chunks = recursive_split_text(
                     p,
-                    chunk_size=chunk_size - len(prefix),
+                    chunk_size=max(_MIN_MARKDOWN_BODY_CHUNK_SIZE, chunk_size - len(prefix)),
                     chunk_overlap=chunk_overlap,
                 )
                 for sc in sub_chunks:
@@ -375,6 +393,111 @@ def split_structured(
     return recursive_split_text(content, chunk_size, chunk_overlap)
 
 
+def _parse_image_tag(match: re.Match[str]) -> tuple[str, str]:
+    """从原子图片正则匹配对象中提取 `(alt 描述, 图片 URL)`。"""
+    tag = match.group(0)
+    if tag.startswith("!"):
+        alt = (match.group("alt") or "").strip()
+        title = (match.group("dq_title") or match.group("sq_title") or "").strip()
+        url = (match.group("bracket_url") or match.group("url") or "").strip()
+        return (alt or title), url
+
+    attrs: dict[str, str] = {}
+    for attr_match in _HTML_ATTR_RE.finditer(tag):
+        attr_name = attr_match.group(1).lower()
+        raw_val = next(
+            (
+                v
+                for v in (attr_match.group(2), attr_match.group(3), attr_match.group(4))
+                if v is not None
+            ),
+            "",
+        )
+        attrs[attr_name] = html.unescape(raw_val).strip()
+
+    src = attrs.get("src") or attrs.get("data-src") or ""
+    alt = attrs.get("alt") or attrs.get("title") or ""
+    return alt, src
+
+
+def extract_images_from_text(text: str) -> list[str]:
+    """从文本中按出现顺序提取并去重所有有效图片 URL（兼容 Markdown 与 HTML img）。
+
+    自动跳过 Markdown 围栏代码块内部的示例语法。
+
+    Args:
+        text: 原始切片或文档文本
+
+    Returns:
+        list[str]: 按文档首次出现顺序去重后的图片 URL 列表；无图片返回空列表
+    """
+    if not text or ("!" not in text and "<img" not in text.lower()):
+        return []
+
+    cleaned = _FENCED_CODE_BLOCK_RE.sub("", text)
+    images: list[str] = []
+    seen: set[str] = set()
+    for match in ATOMIC_IMAGE_PATTERN.finditer(cleaned):
+        _, url = _parse_image_tag(match)
+        if not url or url.startswith("#") or url.lower().startswith("javascript:"):
+            continue
+        if url not in seen:
+            seen.add(url)
+            images.append(url)
+    return images
+
+
+def build_embedding_text(chunk_text: str) -> str:
+    """将切片中的图片标签转换为纯 Alt/Title 语义文本，剔除 URL 字符串噪声以提升向量检索精度。
+
+    - 有非空 `alt`（或 `title`）的图片标签替换为可读描述文本；
+    - 无描述的空图片标签直接移除；
+    - 若剔除后整段为空（纯无 Alt 图片切片），回退返回原切片文本，确保嵌入模型输入非空。
+
+    Args:
+        chunk_text: 存入知识库的原始切片文本（含原始图片标记）
+
+    Returns:
+        str: 仅用于计算 Embedding 向量的语义清洗文本
+    """
+    if not chunk_text or not ATOMIC_IMAGE_PATTERN.search(chunk_text):
+        return chunk_text
+
+    def _replace_with_alt(match: re.Match[str]) -> str:
+        alt, _ = _parse_image_tag(match)
+        return alt if alt else ""
+
+    replaced = ATOMIC_IMAGE_PATTERN.sub(_replace_with_alt, chunk_text)
+    normalized_lines = [re.sub(r"[ \t]{2,}", " ", line).strip() for line in replaced.splitlines()]
+    cleaned = "\n".join(line for line in normalized_lines if line).strip()
+    return cleaned if cleaned else chunk_text.strip()
+
+
+def split_html(
+    html_text: str,
+    chunk_size: int = 600,
+    chunk_overlap: int = 80,
+) -> list[str]:
+    """抽取 HTML 主体文本（保留图片为 Markdown 锚点）并执行原子保护切分。
+
+    Args:
+        html_text: 原始 HTML 字符串
+        chunk_size: 目标切片字符数上限
+        chunk_overlap: 切片滑动重叠字符数
+
+    Returns:
+        list[str]: 切分后的文本切片列表
+    """
+    title, cleaned_text = extract_html_content(html_text)
+    if not cleaned_text:
+        fallback = title.strip()
+        return [fallback] if fallback else []
+    content = (
+        f"# {title}\n\n{cleaned_text}" if title and title not in cleaned_text else cleaned_text
+    )
+    return recursive_split_text(content, chunk_size, chunk_overlap)
+
+
 def dispatch_and_split(
     file_path: Path,
     content: str,
@@ -396,6 +519,8 @@ def dispatch_and_split(
 
     if ext in (".md", ".mdx"):
         return split_markdown(content, chunk_size, chunk_overlap)
+    elif ext in (".html", ".htm"):
+        return split_html(content, chunk_size, chunk_overlap)
     elif ext in CODE_EXTENSIONS:
         return split_code(content, chunk_size, chunk_overlap)
     elif ext in STRUCTURED_EXTENSIONS:
@@ -449,6 +574,18 @@ class HTMLTextExtractor(HTMLParser):
             self._in_title = True
         elif tag_lower in self.IGNORED_TAGS:
             self._ignore_stack.append(tag_lower)
+        elif tag_lower == "img" and not self._ignore_stack:
+            attr_map = {k.lower(): (v or "").strip() for k, v in attrs}
+            src = attr_map.get("src") or attr_map.get("data-src") or ""
+            alt = attr_map.get("alt") or attr_map.get("title") or ""
+            clean_alt = re.sub(r"[\r\n]+", " ", alt)
+            if src:
+                clean_src = re.sub(r"[\r\n]+", "", src)
+                safe_alt = clean_alt.replace("[", "(").replace("]", ")")
+                formatted_src = f"<{clean_src}>" if " " in clean_src else clean_src
+                self._pieces.append(f" ![{safe_alt}]({formatted_src}) ")
+            elif clean_alt:
+                self._pieces.append(f" {clean_alt} ")
 
     def handle_endtag(self, tag: str) -> None:
         tag_lower = tag.lower()
@@ -481,10 +618,12 @@ def extract_html_content(html: str) -> tuple[str, str]:
     try:
         extractor.feed(html)
         extractor.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("HTML 解析异常，已降级返回部分抽取结果: %s", exc)
 
     raw_text = "".join(extractor._pieces)
-    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    lines = [
+        re.sub(r"[ \t]{2,}", " ", line.strip()) for line in raw_text.splitlines() if line.strip()
+    ]
     cleaned_text = "\n\n".join(lines)
     return extractor.title.strip(), cleaned_text

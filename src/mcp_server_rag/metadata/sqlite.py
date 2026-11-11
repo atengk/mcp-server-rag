@@ -19,6 +19,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mcp_server_rag.metadata.base import (
+    CHUNK_QUERY_BATCH_SIZE,
+    CHUNK_SELECT_COLUMNS,
+    deduplicate_chunk_ids,
+    normalize_chunk_row,
+)
+
 logger = logging.getLogger(__name__)
 
 VALID_VISIBILITIES: frozenset[str] = frozenset({"public", "private"})
@@ -518,6 +525,53 @@ class SQLiteMetadataCatalog:
                 (now, kb_name),
             )
             conn.commit()
+
+    def get_chunks_by_ids(
+        self,
+        kb_name: str,
+        chunk_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        """按切片 ID 列表批量查询持久化切片正文、双向链表指针与图片清单。"""
+        unique_ids = deduplicate_chunk_ids(chunk_ids)
+        if not unique_ids:
+            return []
+
+        results: list[dict[str, Any]] = []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for start in range(0, len(unique_ids), CHUNK_QUERY_BATCH_SIZE):
+                batch = unique_ids[start : start + CHUNK_QUERY_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in batch)
+                cursor.execute(
+                    f"""
+                    SELECT {CHUNK_SELECT_COLUMNS}
+                    FROM chunks
+                    WHERE kb_name = ? AND id IN ({placeholders})
+                    ORDER BY doc_id ASC, chunk_index ASC
+                    """,
+                    (kb_name, *batch),
+                )
+                results.extend(normalize_chunk_row(dict(row)) for row in cursor.fetchall())
+        return results
+
+    def get_chunks_by_doc(
+        self,
+        kb_name: str,
+        doc_id: str,
+    ) -> list[dict[str, Any]]:
+        """按文档 ID 查询全部有序切片记录（按 ``chunk_index`` 升序）。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT {CHUNK_SELECT_COLUMNS}
+                FROM chunks
+                WHERE kb_name = ? AND doc_id = ?
+                ORDER BY chunk_index ASC
+                """,
+                (kb_name, doc_id),
+            )
+            return [normalize_chunk_row(dict(row)) for row in cursor.fetchall()]
 
     def register_image_assets(
         self,
