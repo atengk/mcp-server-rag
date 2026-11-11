@@ -35,7 +35,10 @@ class ChromaVectorStoreAdapter:
     def create_kb(self, name: str) -> None:
         """创建知识库对应集合。"""
         coll_name = self._collection_name(name)
-        self._client.get_or_create_collection(name=coll_name)
+        self._client.get_or_create_collection(
+            name=coll_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def clear_kb(self, name: str) -> None:
         """清空知识库所有向量。"""
@@ -44,7 +47,10 @@ class ChromaVectorStoreAdapter:
             self._client.delete_collection(name=coll_name)
         except Exception:
             pass
-        self._client.get_or_create_collection(name=coll_name)
+        self._client.get_or_create_collection(
+            name=coll_name,
+            metadata={"hnsw:space": "cosine"},
+        )
 
     def delete_kb(self, name: str) -> None:
         """物理删除知识库集合。"""
@@ -102,6 +108,87 @@ class ChromaVectorStoreAdapter:
             return int(collection.count())
         except Exception:
             return 0
+
+    def search(
+        self,
+        kb_name: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        where: dict[str, Any] | None = None,
+        where_document: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """在知识库对应集合中执行向量相似度检索。
+
+        Args:
+            kb_name: 知识库名称
+            query_embedding: 查询的高维嵌入向量
+            top_k: 返回候选切片数上限
+            where: 可选的元数据过滤字典
+            where_document: 可选的文档内容过滤字典
+
+        Returns:
+            list[dict[str, Any]]: 排序后的切片结果列表
+        """
+        coll_name = self._collection_name(kb_name)
+        try:
+            collection = self._client.get_collection(name=coll_name)
+        except Exception:
+            return []
+
+        total_count = collection.count()
+        if total_count == 0 or top_k <= 0:
+            return []
+
+        n_results = min(top_k, total_count)
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [query_embedding],
+            "n_results": n_results,
+            "include": ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
+        if where_document:
+            kwargs["where_document"] = where_document
+
+        try:
+            query_res = collection.query(**kwargs)
+        except Exception:
+            return []
+
+        ids_list = query_res.get("ids", [[]])
+        docs_list = query_res.get("documents", [[]])
+        metas_list = query_res.get("metadatas", [[]])
+        dists_list = query_res.get("distances", [[]])
+
+        ids = ids_list[0] if ids_list else []
+        docs = docs_list[0] if docs_list else []
+        metas = metas_list[0] if metas_list else []
+        dists = dists_list[0] if dists_list else []
+
+        coll_meta = collection.metadata or {}
+        is_cosine = coll_meta.get("hnsw:space") == "cosine"
+
+        results: list[dict[str, Any]] = []
+        for cid, text, m, dist in zip(ids, docs, metas, dists):
+            if dist is None:
+                score = 0.0
+            elif is_cosine:
+                score = 1.0 - float(dist)
+            else:
+                score = 1.0 - (float(dist) / 2.0)
+
+            clamped_score = round(max(0.0, min(1.0, score)), 4)
+            results.append(
+                {
+                    "chunk_id": str(cid),
+                    "text": str(text or ""),
+                    "score": clamped_score,
+                    "metadata": m or {},
+                    "kb_name": kb_name,
+                }
+            )
+
+        return results
 
     def ping(self) -> bool:
         """测试 ChromaDB 客户端健康度。"""

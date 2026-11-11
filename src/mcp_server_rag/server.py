@@ -351,6 +351,166 @@ def rag_index_text(
     }
 
 
+def _build_chroma_where(metadata_filter: dict[str, Any] | None) -> dict[str, Any] | None:
+    """将通用的元数据字典转换为 ChromaDB 合法的 where 过滤语句。"""
+    if not metadata_filter:
+        return None
+    # 若已经包含 Chroma 原生逻辑操作符（如 $and, $or），直接透传
+    if any(k.startswith("$") for k in metadata_filter):
+        return metadata_filter
+
+    if len(metadata_filter) == 1:
+        k, v = next(iter(metadata_filter.items()))
+        if isinstance(v, dict):
+            return {k: v}
+        return {k: {"$eq": v}}
+
+    conditions: list[dict[str, Any]] = []
+    for k, v in metadata_filter.items():
+        if isinstance(v, dict):
+            conditions.append({k: v})
+        else:
+            conditions.append({k: {"$eq": v}})
+    return {"$and": conditions}
+
+
+def _build_chroma_where_document(keyword: str | None) -> dict[str, Any] | None:
+    """将精准关键词转换为 ChromaDB 合法的 where_document 过滤语句。"""
+    if not keyword or not keyword.strip():
+        return None
+    kw = keyword.strip()
+    cases = list(dict.fromkeys([kw, kw.lower(), kw.upper()]))
+    if len(cases) == 1:
+        return {"$contains": cases[0]}
+    return {"$or": [{"$contains": c} for c in cases]}
+
+
+@mcp.tool()
+def rag_search(
+    kb_name: str,
+    query: str,
+    top_k: int = 5,
+    threshold: float = 0.0,
+    keyword: str | None = None,
+    metadata_filter: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """在指定知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与元数据过滤。
+
+    Args:
+        kb_name: 目标知识库名称
+        query: 检索查询文本
+        top_k: 返回相似切片的最大数量（默认为 5）
+        threshold: 相似度截断阈值，过滤掉低于此分数的切片（范围 0.0 ~ 1.0）
+        keyword: 可选的精准关键词，切片正文必须包含此词（大小写无关）
+        metadata_filter: 可选的元数据字典过滤条件（如 {"category": "tech"}）
+
+    Returns:
+        list[dict[str, Any]]: 排序后的相似切片列表，
+            每个切片包含 chunk_id, text, score, metadata, kb_name
+    """
+    if not query or not query.strip():
+        return []
+
+    settings = get_settings()
+    catalog, vector_store = _get_services()
+
+    # 1. 校验知识库是否存在
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return []
+
+    # 2. 构造底层向量数据库过滤条件
+    where = _build_chroma_where(metadata_filter)
+    where_document = _build_chroma_where_document(keyword)
+
+    # 3. 计算查询向量
+    embedding_provider = get_embedding_provider(settings)
+    query_vector = embedding_provider.embed_query(query.strip())
+
+    # 4. 执行向量检索召回候选切片
+    candidates = vector_store.search(
+        kb_name=kb_name,
+        query_embedding=query_vector,
+        top_k=top_k,
+        where=where,
+        where_document=where_document,
+    )
+
+    # 5. 精确过滤（阈值截断、关键词与元数据二次校验）
+    filtered: list[dict[str, Any]] = []
+    clean_kw = keyword.strip().lower() if keyword and keyword.strip() else None
+
+    for item in candidates:
+        # 相似度阈值过滤
+        if item["score"] < threshold:
+            continue
+        # 精准关键词严格匹配验证
+        if clean_kw and clean_kw not in item["text"].lower():
+            continue
+        # 元数据严格匹配二次校验
+        if metadata_filter:
+            item_meta = item.get("metadata", {})
+            match = True
+            for mk, mv in metadata_filter.items():
+                if not mk.startswith("$") and item_meta.get(mk) != mv:
+                    match = False
+                    break
+            if not match:
+                continue
+        filtered.append(item)
+
+    return filtered[:top_k]
+
+
+@mcp.tool()
+def rag_query_with_context(
+    kb_name: str,
+    query: str,
+    top_k: int = 5,
+    threshold: float = 0.0,
+    keyword: str | None = None,
+    metadata_filter: dict[str, Any] | None = None,
+) -> str:
+    """检索知识库相关上下文并组装为带来源引用的 Markdown 增强提示词。
+
+    Args:
+        kb_name: 目标知识库名称
+        query: 检索查询问题或主题
+        top_k: 返回参考切片的最大数量（默认为 5）
+        threshold: 相似度截断阈值，过滤掉低于此分数的切片
+        keyword: 可选的精准关键词
+        metadata_filter: 可选的元数据字典过滤条件
+
+    Returns:
+        str: 组装后的 Markdown 提示词字符串；若无匹配内容则返回未检索到上下文提示
+    """
+    chunks = rag_search(
+        kb_name=kb_name,
+        query=query,
+        top_k=top_k,
+        threshold=threshold,
+        keyword=keyword,
+        metadata_filter=metadata_filter,
+    )
+
+    if not chunks:
+        return "未检索到与查询相关的上下文内容。"
+
+    context_sections: list[str] = ["根据以下检索到的相关知识库参考资料回答问题：\n"]
+    for i, chunk in enumerate(chunks, 1):
+        meta = chunk.get("metadata", {})
+        title = meta.get("title") or meta.get("doc_id") or chunk.get("chunk_id", f"文档_{i}")
+        score = chunk.get("score", 0.0)
+        raw_text = chunk.get("text", "").strip()
+        quoted_text = (
+            "\n".join(f"> {line}" for line in raw_text.splitlines()) if raw_text else "> (空内容)"
+        )
+        section = f"### 📚 参考片段 [{i}] (来源: {title}, 相似度: {score:.4f})\n{quoted_text}\n"
+        context_sections.append(section)
+
+    return "\n".join(context_sections).strip()
+
+
 def main() -> None:
     """运行 MCP 服务主入口。"""
     mcp.run()

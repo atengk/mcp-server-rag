@@ -40,6 +40,28 @@ class VectorStoreAdapter(Protocol):
         """从知识库中删除指定切片 ID 列表。"""
         ...
 
+    def search(
+        self,
+        kb_name: str,
+        query_embedding: list[float],
+        top_k: int = 5,
+        where: dict[str, Any] | None = None,
+        where_document: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """检索指定知识库中最相似的切片。
+
+        Args:
+            kb_name: 目标知识库名称
+            query_embedding: 查询的高维嵌入向量
+            top_k: 返回候选切片数上限
+            where: 可选的元数据过滤条件
+            where_document: 可选的文档正文过滤条件
+
+        Returns:
+            list[dict[str, Any]]: 包含 chunk_id, text, score, metadata, kb_name 的切片字典列表
+        """
+        ...
+
     def count(self, name: str) -> int:
         """获取指定知识库的向量总数。"""
         ...
