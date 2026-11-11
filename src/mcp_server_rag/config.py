@@ -9,6 +9,7 @@
 
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 from pydantic import BaseModel, Field
 
@@ -90,6 +91,64 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("MCP_RAG_MILVUS_URI", "http://localhost:19530").strip()
     )
     milvus_token: str = Field(default_factory=lambda: os.getenv("MCP_RAG_MILVUS_TOKEN", "").strip())
+    metadata_store: str = Field(
+        default_factory=lambda: (
+            os.getenv("MCP_RAG_METADATA_STORE", "sqlite").strip().lower() or "sqlite"
+        )
+    )
+    database_url: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DATABASE_URL", "").strip())
+    db_host: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_HOST", "").strip())
+    db_port: int | None = Field(
+        default_factory=lambda: _parse_optional_int_env("MCP_RAG_DB_PORT", min_val=1)
+    )
+    db_user: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_USER", "").strip())
+    db_password: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_PASSWORD", "").strip())
+    db_name: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_NAME", "").strip())
+
+    def resolved_database_url(self) -> str:
+        """解析最终生效的数据库连接 DSN。
+
+        优先使用显式设置的 ``MCP_RAG_DATABASE_URL``；否则在指定了 ``MCP_RAG_DB_HOST`` 等拆分变量时，
+        按当前 ``metadata_store`` 方言拼接标准化连接串（对用户名与密码执行 URL 编码）。
+
+        Returns:
+            数据库连接 URL 字符串；若未配置外部连接信息且使用内置 SQLite，则返回默认本地路径连接串。
+        """
+        if self.database_url:
+            return self.database_url
+
+        if self.metadata_store == "sqlite":
+            if not self.db_name:
+                return f"sqlite:///{(self.data_dir / 'metadata.db').as_posix()}"
+            if self.db_name.startswith("sqlite:"):
+                return self.db_name
+            db_candidate = Path(self.db_name)
+            resolved_db = (
+                db_candidate if db_candidate.is_absolute() else (self.data_dir / db_candidate)
+            )
+            return f"sqlite:///{resolved_db.as_posix()}"
+
+        if not self.db_host:
+            return ""
+
+        scheme_defaults: dict[str, tuple[str, int]] = {
+            "postgresql": ("postgresql", 5432),
+            "mysql": ("mysql", 3306),
+        }
+        scheme, default_port = scheme_defaults.get(self.metadata_store, (self.metadata_store, 5432))
+        port = self.db_port if self.db_port is not None else default_port
+
+        auth = ""
+        if self.db_user:
+            encoded_user = quote(self.db_user, safe="")
+            if self.db_password:
+                encoded_password = quote(self.db_password, safe="")
+                auth = f"{encoded_user}:{encoded_password}@"
+            else:
+                auth = f"{encoded_user}@"
+
+        db_name_part = f"/{quote(self.db_name, safe='')}" if self.db_name else ""
+        return f"{scheme}://{auth}{self.db_host}:{port}{db_name_part}"
 
 
 def get_settings() -> Settings:

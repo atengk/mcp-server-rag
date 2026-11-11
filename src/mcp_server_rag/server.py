@@ -19,7 +19,7 @@ from mcp.server import MCPServer
 
 from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
-from mcp_server_rag.metadata import MetadataCatalog
+from mcp_server_rag.metadata import MetadataCatalogAdapter, get_metadata_catalog
 from mcp_server_rag.parsers import (
     dispatch_and_split,
     extract_html_content,
@@ -38,10 +38,10 @@ READ_ONLY_BLOCK_MSG: str = (
 )
 
 
-def _get_services() -> tuple[MetadataCatalog, VectorStoreAdapter]:
+def _get_services() -> tuple[MetadataCatalogAdapter, VectorStoreAdapter]:
     """获取当前配置对应的元数据目录与向量存储适配器实例。"""
     settings = get_settings()
-    catalog = MetadataCatalog(settings.data_dir)
+    catalog = get_metadata_catalog(settings)
     vector_store = get_vector_store(settings)
     return catalog, vector_store
 
@@ -56,7 +56,7 @@ def _validate_kb_name(name: str) -> tuple[bool, str]:
 
 
 def _validate_kb_for_write(
-    catalog: MetadataCatalog,
+    catalog: MetadataCatalogAdapter,
     kb_name: str,
     settings: Settings,
 ) -> dict[str, Any] | None:
@@ -84,8 +84,19 @@ def _validate_kb_for_write(
             ),
         }
 
-    # 空知识库允许随当前运行时模型更新绑定
-    catalog.update_kb_embedding_model(kb_name, current_model)
+    # 空知识库允许随当前运行时模型更新绑定，并同步更新向量维度
+    target_dim = settings.embedding_dimension
+    if target_dim is None:
+        try:
+            target_dim = get_embedding_provider(settings).dimension
+        except Exception as exc:
+            logger.warning("空知识库 '%s' 切换模型时探测 Embedding 维度失败: %s", kb_name, exc)
+            target_dim = 0
+    catalog.update_kb_embedding_model(
+        kb_name,
+        current_model,
+        embedding_dimension=int(target_dim or 0),
+    )
     return None
 
 
@@ -102,12 +113,19 @@ def health_check() -> dict[str, str]:
     }
 
 
-def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
+def rag_create_kb(
+    name: str,
+    description: str = "",
+    owner: str = "default",
+    visibility: str = "public",
+) -> dict[str, Any]:
     """创建新的知识库命名空间与底层向量存储集合。
 
     Args:
         name: 知识库名称，全局唯一标识（仅限字母、数字、下划线、连字符）
         description: 知识库的详细描述说明信息
+        owner: 知识库所属创建者标识，默认 ``"default"``
+        visibility: 知识库可见性范围（``"public"`` 或 ``"private"``），默认 ``"public"``
 
     Returns:
         dict[str, Any]: 创建结果状态与说明
@@ -123,6 +141,16 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
     valid, err_msg = _validate_kb_name(name)
     if not valid:
         return {"success": False, "name": name, "message": err_msg}
+
+    normalized_visibility = visibility.strip().lower()
+    if normalized_visibility not in {"public", "private"}:
+        return {
+            "success": False,
+            "name": name,
+            "message": (
+                f"非法的知识库可见性 visibility='{visibility}'，仅支持 'public' 或 'private'"
+            ),
+        }
 
     catalog, vector_store = _get_services()
 
@@ -150,11 +178,14 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
                 }
             target_dim = None
 
-    # 2. 在 SQLite 中注册知识库元数据
+    # 2. 在元数据目录中注册知识库扩展字段
     created = catalog.create_kb(
         name=name,
         description=description,
         embedding_model=settings.embedding_model,
+        embedding_dimension=int(target_dim or 0),
+        owner=owner,
+        visibility=normalized_visibility,
     )
     if not created:
         return {
@@ -383,6 +414,7 @@ def rag_doctor() -> dict[str, Any]:
         "disk_free_bytes": free,
         "vector_store": settings.vector_store,
         "vector_store_status": "ok" if vector_store_ok else "error",
+        "metadata_store": settings.metadata_store,
         "metadata_catalog_status": "ok" if sqlite_ok else "error",
         "embedding_provider": settings.embedding_provider,
         "embedding_model": settings.embedding_model,
@@ -505,6 +537,7 @@ def rag_index_text(
         source_uri="",
         chunk_ids=chunk_ids,
         file_size=len(raw_text.encode("utf-8")),
+        chunk_contents=chunks,
     )
 
     return {
@@ -638,6 +671,7 @@ def rag_index_file(
         source_uri=str(path),
         chunk_ids=chunk_ids,
         file_size=len(raw_content.encode("utf-8")),
+        chunk_contents=chunks,
     )
 
     return {
@@ -964,6 +998,7 @@ def rag_index_url(
         source_uri=clean_url,
         chunk_ids=chunk_ids,
         file_size=len(text_content.encode("utf-8")),
+        chunk_contents=chunks,
     )
 
     return {
@@ -1013,7 +1048,7 @@ def _build_chroma_where_document(keyword: str | None) -> dict[str, Any] | None:
 
 
 def _resolve_target_kbs(
-    catalog: MetadataCatalog,
+    catalog: MetadataCatalogAdapter,
     kb_name: str | list[str],
 ) -> tuple[list[str], bool]:
     """解析目标知识库清单并标识是否为跨库联合检索模式。
