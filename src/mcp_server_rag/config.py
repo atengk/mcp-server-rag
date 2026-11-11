@@ -104,6 +104,42 @@ class Settings(BaseModel):
     db_user: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_USER", "").strip())
     db_password: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_PASSWORD", "").strip())
     db_name: str = Field(default_factory=lambda: os.getenv("MCP_RAG_DB_NAME", "").strip())
+    storage_type: str = Field(
+        default_factory=lambda: (
+            os.getenv("MCP_RAG_STORAGE_TYPE", "local").strip().lower() or "local"
+        )
+    )
+    s3_bucket: str = Field(default_factory=lambda: os.getenv("MCP_RAG_S3_BUCKET", "").strip())
+    s3_endpoint: str = Field(default_factory=lambda: os.getenv("MCP_RAG_S3_ENDPOINT", "").strip())
+    s3_region: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_S3_REGION", "us-east-1").strip() or "us-east-1"
+    )
+    s3_access_key: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_S3_ACCESS_KEY", "").strip()
+    )
+    s3_secret_key: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_S3_SECRET_KEY", "").strip()
+    )
+    s3_prefix: str = Field(default_factory=lambda: os.getenv("MCP_RAG_S3_PREFIX", "assets").strip())
+    s3_public_base_url: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_S3_PUBLIC_BASE_URL", "").strip()
+    )
+    s3_timeout_seconds: int = Field(
+        default_factory=lambda: _parse_int_env("MCP_RAG_S3_TIMEOUT_SECONDS", 30, min_val=1)
+    )
+    archive_remote_images: bool = Field(
+        default_factory=lambda: _parse_bool_env("MCP_RAG_ARCHIVE_REMOTE_IMAGES", False)
+    )
+    remote_image_timeout_seconds: int = Field(
+        default_factory=lambda: _parse_int_env(
+            "MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS", 15, min_val=1
+        )
+    )
+    remote_image_max_bytes: int = Field(
+        default_factory=lambda: _parse_int_env(
+            "MCP_RAG_REMOTE_IMAGE_MAX_BYTES", 10 * 1024 * 1024, min_val=1024
+        )
+    )
 
     def resolved_database_url(self) -> str:
         """解析最终生效的数据库连接 DSN。

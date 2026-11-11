@@ -11,19 +11,29 @@ import hashlib
 import logging
 import re
 import shutil
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError
+from mcp.server.mcpserver.resources.templates import ResourceTemplate
+from mcp.server.mcpserver.resources.types import FunctionResource
+from mcp.types import Resource as MCPResource
 
-from mcp_server_rag.assets import (
-    ExtractedImage,
-    cleanup_document_local_assets,
-    cleanup_kb_local_assets,
-    cleanup_stale_document_assets,
-    persist_local_image_assets,
+from mcp_server_rag.asset_gateway import (
+    PreparedDocumentAssets,
+    cleanup_document_gateway_assets,
+    cleanup_kb_gateway_assets,
+    cleanup_stale_gateway_assets,
+    is_text_markup_document,
+    list_gateway_asset_descriptors,
+    persist_and_register_document_assets,
+    prepare_document_assets,
+    read_gateway_image_asset,
 )
 from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
@@ -198,6 +208,62 @@ def _persist_indexed_document(
         raise
 
 
+def _commit_document_with_assets(
+    settings: Settings,
+    catalog: MetadataCatalogAdapter,
+    vector_store: VectorStoreAdapter,
+    doc: _DocumentIndexSpec,
+    *,
+    existing: dict[str, Any] | None,
+    prepared_assets: PreparedDocumentAssets | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """协同写入文档元数据、向量切片与图片资产（支持异常补偿回滚与陈旧资产清理）。"""
+    status = "indexed"
+    old_assets: list[dict[str, Any]] = []
+    if existing:
+        old_assets = catalog.list_image_assets(doc.kb_name, doc_id=doc.doc_id)
+        deleted_chunk_ids = catalog.delete_document(doc.kb_name, doc.doc_id)
+        vector_store.delete_chunks(doc.kb_name, deleted_chunk_ids)
+        status = "updated"
+
+    written_assets: list[dict[str, Any]] = []
+    try:
+        _persist_indexed_document(settings, catalog, vector_store, doc)
+        if prepared_assets is not None and prepared_assets.images:
+            written_assets = persist_and_register_document_assets(
+                settings,
+                catalog,
+                doc.kb_name,
+                doc.doc_id,
+                prepared_assets,
+            )
+    except Exception:
+        try:
+            rolled_chunk_ids = catalog.delete_document(doc.kb_name, doc.doc_id)
+            vector_store.delete_chunks(doc.kb_name, rolled_chunk_ids or doc.chunk_ids)
+        except Exception as rollback_exc:
+            logger.warning(
+                "索引资产失败回滚元数据/向量库异常 (%s): %s",
+                doc.doc_id,
+                rollback_exc,
+            )
+        cleanup_document_gateway_assets(
+            settings,
+            doc.kb_name,
+            doc.doc_id,
+            old_assets + written_assets,
+        )
+        raise
+
+    if existing and old_assets:
+        if not written_assets:
+            cleanup_document_gateway_assets(settings, doc.kb_name, doc.doc_id, old_assets)
+        else:
+            cleanup_stale_gateway_assets(settings, old_assets, written_assets)
+
+    return status, written_assets
+
+
 def health_check() -> dict[str, str]:
     """检查 RAG MCP 服务基础运行状态。
 
@@ -343,9 +409,9 @@ def rag_clear_kb(name: str) -> dict[str, Any]:
     kb_assets = catalog.list_image_assets(name)
     catalog.clear_kb(name)
 
-    # 2. 清空向量库数据并清理物理图片文件
+    # 2. 清空向量库数据并清理物理图片文件及 S3 对象
     vector_store.clear_kb(name)
-    cleanup_kb_local_assets(settings.data_dir, name, kb_assets)
+    cleanup_kb_gateway_assets(settings, name, kb_assets)
 
     return {
         "success": True,
@@ -385,9 +451,9 @@ def rag_delete_kb(name: str) -> dict[str, Any]:
     kb_assets = catalog.list_image_assets(name)
     vector_store.delete_kb(name)
 
-    # 2. 删除 SQLite 元数据并同步清理物理图片资产目录
+    # 2. 删除 SQLite 元数据并同步清理物理图片资产目录及 S3 对象
     catalog.delete_kb(name)
-    cleanup_kb_local_assets(settings.data_dir, name, kb_assets)
+    cleanup_kb_gateway_assets(settings, name, kb_assets)
 
     return {
         "success": True,
@@ -453,10 +519,10 @@ def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
     doc_assets = catalog.list_image_assets(kb_name, doc_id=actual_doc_id)
     deleted_chunk_ids = catalog.delete_document(kb_name, actual_doc_id)
 
-    # 4. 在向量数据库中删除对应向量切片并清理本地物理图片资产
+    # 4. 在向量数据库中删除对应向量切片并清理本地物理图片与 S3 对象资产
     if deleted_chunk_ids:
         vector_store.delete_chunks(kb_name, deleted_chunk_ids)
-    cleanup_document_local_assets(settings.data_dir, kb_name, actual_doc_id, doc_assets)
+    cleanup_document_gateway_assets(settings, kb_name, actual_doc_id, doc_assets)
 
     return {
         "success": True,
@@ -524,6 +590,8 @@ def rag_doctor() -> dict[str, Any]:
         "embedding_model": settings.embedding_model,
         "embedding_dimension": embedding_dimension,
         "embedding_status": embedding_status,
+        "storage_type": settings.storage_type,
+        "archive_remote_images": settings.archive_remote_images,
         "read_only": settings.read_only,
         "knowledge_bases_count": kb_count,
         "documents_count": doc_count,
@@ -591,25 +659,28 @@ def rag_index_text(
             ),
         }
 
-    # 3. 若为更新，先清理旧切片
-    status = "indexed"
-    if existing:
-        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
-        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
-        status = "updated"
-
-    # 4. 递归切片
-    chunks = recursive_split_text(
+    # 3. 预处理图片外链安全归档、切分与向量计算（失败时不误删存量版本）
+    prepared_assets = prepare_document_assets(
+        settings,
+        kb_name,
+        doc_id,
         raw_text,
+    )
+    chunks = recursive_split_text(
+        prepared_assets.processed_text,
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
     )
     if not chunks:
-        chunks = [raw_text]
+        chunks = [prepared_assets.processed_text]
 
-    # 5. 计算语义向量并协同持久化至向量库与元数据目录
+    embedding_provider = get_embedding_provider(settings)
+    embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
+    precomputed_embeddings = embedding_provider.embed_texts(embedding_texts)
+
+    # 4. 协同写入文档元数据、向量切片与图片资产（含回滚与陈旧清理）
     chunk_ids = [f"{doc_id}_{i}" for i in range(len(chunks))]
-    _persist_indexed_document(
+    status, _ = _commit_document_with_assets(
         settings,
         catalog,
         vector_store,
@@ -623,7 +694,10 @@ def rag_index_text(
             chunks=chunks,
             chunk_ids=chunk_ids,
             user_metadata=metadata,
+            precomputed_embeddings=precomputed_embeddings,
         ),
+        existing=existing,
+        prepared_assets=prepared_assets,
     )
 
     return {
@@ -707,7 +781,8 @@ def rag_index_file(
             "message": f"File '{title}' content unchanged, skipped indexing",
         }
 
-    extracted_images: list[ExtractedImage] = []
+    prepared_assets: PreparedDocumentAssets | None = None
+    ext = path.suffix.lower()
     if is_office:
         try:
             parsed_office = parse_office_document(path, kb_name=kb_name, doc_id=doc_id)
@@ -717,40 +792,87 @@ def rag_index_file(
             logger.warning("解析二进制文档 '%s' 失败: %s", path.name, exc)
             return {"success": False, "message": f"解析文档 '{title}' 失败: {exc}"}
         raw_content = parsed_office.markdown_text
-        extracted_images = parsed_office.images
         if not raw_content or not raw_content.strip():
             return {"success": False, "message": "文档未提取到有效文本或图片内容"}
         file_size = path.stat().st_size
+        prepared_assets = prepare_document_assets(
+            settings,
+            kb_name,
+            doc_id,
+            raw_content,
+            pre_extracted_images=parsed_office.images,
+        )
+        chunks = dispatch_and_split(
+            file_path=path,
+            content=prepared_assets.processed_text,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+        if not chunks:
+            chunks = [prepared_assets.processed_text]
+    elif ext in {".html", ".htm"}:
+        file_size = len(raw_content.encode("utf-8"))
+        html_title, cleaned_html = extract_html_content(raw_content)
+        normalized_html = (
+            f"# {html_title}\n\n{cleaned_html}"
+            if html_title and html_title not in cleaned_html
+            else (cleaned_html or html_title.strip())
+        )
+        prepared_assets = prepare_document_assets(
+            settings,
+            kb_name,
+            doc_id,
+            normalized_html,
+            base_dir=path.parent,
+        )
+        chunks = (
+            recursive_split_text(
+                prepared_assets.processed_text,
+                settings.chunk_size,
+                settings.chunk_overlap,
+            )
+            if prepared_assets.processed_text
+            else []
+        )
+        if not chunks:
+            chunks = [prepared_assets.processed_text or raw_content]
+    elif is_text_markup_document(path):
+        file_size = len(raw_content.encode("utf-8"))
+        prepared_assets = prepare_document_assets(
+            settings,
+            kb_name,
+            doc_id,
+            raw_content,
+            base_dir=path.parent,
+        )
+        chunks = dispatch_and_split(
+            file_path=path,
+            content=prepared_assets.processed_text,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+        if not chunks:
+            chunks = [prepared_assets.processed_text]
     else:
         file_size = len(raw_content.encode("utf-8"))
+        chunks = dispatch_and_split(
+            file_path=path,
+            content=raw_content,
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap,
+        )
+        if not chunks:
+            chunks = [raw_content]
 
-    # 3. 先完成结构感知切片与向量计算，确保失败时不误删存量版本及资产
-    chunks = dispatch_and_split(
-        file_path=path,
-        content=raw_content,
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
-    )
-    if not chunks:
-        chunks = [raw_content]
-
+    # 3. 提前完成向量计算，确保 S3 校验或嵌入失败时不误删存量版本
     embedding_provider = get_embedding_provider(settings)
     embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
     precomputed_embeddings = embedding_provider.embed_texts(embedding_texts)
 
-    # 4. 清理旧版本记录与旧向量（陈旧物理图片待新版本落盘及登记成功后再行裁剪）
-    status = "indexed"
-    old_assets: list[dict[str, Any]] = []
-    if existing:
-        old_assets = catalog.list_image_assets(kb_name, doc_id=doc_id)
-        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
-        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
-        status = "updated"
-
-    # 5. 生成全局唯一切片 ID 并协同持久化至向量库、元数据目录与本地图片资产
+    # 4. 协同写入文档元数据、向量切片与图片资产（含失败补偿回滚及陈旧资产清理）
     path_hash = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8]
     chunk_ids = [f"{path.stem}_{path_hash}_{i}" for i in range(len(chunks))]
-    _persist_indexed_document(
+    status, _ = _commit_document_with_assets(
         settings,
         catalog,
         vector_store,
@@ -771,38 +893,9 @@ def rag_index_file(
             },
             precomputed_embeddings=precomputed_embeddings,
         ),
+        existing=existing,
+        prepared_assets=prepared_assets,
     )
-
-    written_assets: list[dict[str, Any]] = []
-    try:
-        if extracted_images:
-            written_assets = persist_local_image_assets(
-                settings.data_dir,
-                kb_name,
-                doc_id,
-                extracted_images,
-            )
-            catalog.register_image_assets(kb_name, doc_id, written_assets)
-    except Exception:
-        # 补偿回滚：撤回本轮已提交文档与向量切片及部分落盘图片，防止后续重试误判 skipped
-        try:
-            rolled_chunk_ids = catalog.delete_document(kb_name, doc_id)
-            vector_store.delete_chunks(kb_name, rolled_chunk_ids or chunk_ids)
-        except Exception as rollback_exc:
-            logger.warning("索引资产失败回滚元数据/向量库异常 (%s): %s", doc_id, rollback_exc)
-        cleanup_document_local_assets(
-            settings.data_dir,
-            kb_name,
-            doc_id,
-            old_assets + written_assets,
-        )
-        raise
-
-    if existing and old_assets:
-        if not extracted_images:
-            cleanup_document_local_assets(settings.data_dir, kb_name, doc_id, old_assets)
-        else:
-            cleanup_stale_document_assets(settings.data_dir, old_assets, written_assets)
 
     return {
         "success": True,
@@ -1080,23 +1173,36 @@ def rag_index_url(
             "message": f"URL '{clean_url}' content unchanged, skipped indexing",
         }
 
-    status = "indexed"
-    if existing:
-        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
-        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
-        status = "updated"
-
-    # 切片分发
+    # 外链安全归档预处理与切片分发
+    prepared_assets = prepare_document_assets(
+        settings,
+        kb_name,
+        doc_id,
+        text_content,
+        source_url=clean_url,
+    )
     if "markdown" in content_type:
-        chunks = split_markdown(text_content, settings.chunk_size, settings.chunk_overlap)
+        chunks = split_markdown(
+            prepared_assets.processed_text,
+            settings.chunk_size,
+            settings.chunk_overlap,
+        )
     else:
-        chunks = recursive_split_text(text_content, settings.chunk_size, settings.chunk_overlap)
+        chunks = recursive_split_text(
+            prepared_assets.processed_text,
+            settings.chunk_size,
+            settings.chunk_overlap,
+        )
     if not chunks:
-        chunks = [text_content]
+        chunks = [prepared_assets.processed_text]
+
+    embedding_provider = get_embedding_provider(settings)
+    embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
+    precomputed_embeddings = embedding_provider.embed_texts(embedding_texts)
 
     url_hash = hashlib.md5(clean_url.encode("utf-8")).hexdigest()[:8]
     chunk_ids = [f"url_{url_hash}_{i}" for i in range(len(chunks))]
-    _persist_indexed_document(
+    status, _ = _commit_document_with_assets(
         settings,
         catalog,
         vector_store,
@@ -1115,7 +1221,10 @@ def rag_index_url(
                 "source_uri": clean_url,
                 "content_type": content_type,
             },
+            precomputed_embeddings=precomputed_embeddings,
         ),
+        existing=existing,
+        prepared_assets=prepared_assets,
     )
 
     return {
@@ -1568,25 +1677,120 @@ def rag_query_with_context(
     return "\n".join(context_sections).strip()
 
 
+class _ImageAssetResourceTemplate(ResourceTemplate):
+    """按资产 URI 模板动态加载图片二进制字节与对应 MIME 类型的 MCP Resource 模板。"""
+
+    async def create_resource(
+        self,
+        uri: str,
+        params: dict[str, Any],
+        context: Any,
+    ) -> FunctionResource:
+        """依据模板提取的单级路径参数读取图片载荷并封装精确 MIME 响应。"""
+        _ = context
+        kb_name = str(params.get("kb_name") or "")
+        doc_id = str(params.get("doc_id") or "")
+        filename = str(params.get("filename") or "")
+
+        try:
+            payload_raw, mime_raw = await anyio.to_thread.run_sync(
+                self.fn,
+                kb_name,
+                doc_id,
+                filename,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            raise ResourceNotFoundError(str(exc)) from exc
+        except ImportError as exc:
+            raise ResourceError(str(exc)) from exc
+
+        payload = bytes(payload_raw)
+        mime_type = str(mime_raw)
+
+        def _read_payload() -> bytes:
+            return payload
+
+        return FunctionResource(
+            uri=uri,
+            name=filename,
+            title=self.title,
+            description=self.description,
+            mime_type=mime_type,
+            icons=self.icons,
+            annotations=self.annotations,
+            meta=self.meta,
+            fn=_read_payload,
+        )
+
+
+class _RagMCPServer(MCPServer[Any]):
+    """支持从 Metadata Catalog 动态列举图片资产资源的 FastMCP 扩展实例。"""
+
+    def __init__(
+        self,
+        *args: Any,
+        dynamic_resources_loader: Callable[[], list[MCPResource]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._dynamic_resources_loader = dynamic_resources_loader
+
+    async def list_resources(self) -> list[MCPResource]:
+        """合并静态注册资源与 Metadata Catalog 中登记的实时图片资产清单。"""
+        static_resources = await super().list_resources()
+        if self._dynamic_resources_loader is None:
+            return static_resources
+        dynamic_resources = await anyio.to_thread.run_sync(self._dynamic_resources_loader)
+        existing_uris = {item.uri for item in static_resources}
+        return static_resources + [
+            item for item in dynamic_resources if item.uri not in existing_uris
+        ]
+
+
 def create_server(settings: Settings | None = None) -> FastMCP:
     """构建并配置 FastMCP 服务端实例。
 
     根据运行时 Settings 配置（如 MCP_RAG_READ_ONLY）决定是否暴露写操作类工具：
-    - 当 read_only=True 时，仅暴露只读查询与自检工具
-      (rag_search, rag_query_with_context, rag_list_kbs, rag_doctor, health_check)；
-    - 当 read_only=False 时，注册包含写操作、索引、建库与删除类在内的全部 13 项工具。
+    - 当 read_only=True 时，仅暴露只读查询、自检工具与 MCP Resource 只读图片网关；
+    - 当 read_only=False 时，额外注册写操作、索引、建库与删除类工具。
 
     Args:
-        settings: 可选的自定义运行时配置，缺省时自动读取当前全局配置
+        settings: 可选的自定义运行时配置，缺省时按调用时机动态读取当前全局配置。
 
     Returns:
-        FastMCP: 配置并注册完成的 FastMCP 服务端实例
+        FastMCP: 配置并注册完成的 FastMCP 服务端实例。
     """
     cfg = settings or get_settings()
-    server = FastMCP(
+    resolve_cfg: Callable[[], Settings] = (
+        (lambda: settings) if settings is not None else get_settings
+    )
+
+    def _list_dynamic_image_resources() -> list[MCPResource]:
+        active_cfg = resolve_cfg()
+        catalog = get_metadata_catalog(active_cfg)
+        return [MCPResource(**entry) for entry in list_gateway_asset_descriptors(catalog)]
+
+    def _read_image_asset_sync(kb_name: str, doc_id: str, filename: str) -> tuple[bytes, str]:
+        active_cfg = resolve_cfg()
+        catalog = get_metadata_catalog(active_cfg)
+        return read_gateway_image_asset(active_cfg, catalog, kb_name, doc_id, filename)
+
+    server = _RagMCPServer(
         name="mcp-server-rag",
         instructions="Model Context Protocol Server for Retrieval-Augmented Generation (RAG).",
+        dynamic_resources_loader=_list_dynamic_image_resources,
     )
+
+    # 0. 注册多模态图片资产 MCP Resource Gateway（只读与读写模式下均保持可用）
+    asset_template = _ImageAssetResourceTemplate.from_function(
+        fn=_read_image_asset_sync,
+        uri_template="rag://assets/{kb_name}/{doc_id}/{filename}",
+        name="rag_image_asset",
+        title="RAG 图片资产共享网关",
+        description="按知识库、文档标识与文件名读取已登记的多模态图片二进制流与 MIME 类型",
+        mime_type="application/octet-stream",
+    )
+    server._resource_manager._templates[asset_template.uri_template] = asset_template
 
     # 1. 注册核心只读工具
     server.add_tool(health_check)

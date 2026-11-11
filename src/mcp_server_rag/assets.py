@@ -76,8 +76,8 @@ def _load_pil_image_module() -> Any:
         ) from exc
 
 
-def _validate_path_segment(value: str, label: str) -> str:
-    """校验用于拼接目录的单级路径段，拦截空值、路径分隔符与目录穿越段。"""
+def validate_asset_segment(value: str, label: str) -> str:
+    """校验用于拼接目录或对象键的单级路径段，拦截空值、路径分隔符与目录穿越段。"""
     clean = value.strip()
     if (
         not clean
@@ -89,6 +89,11 @@ def _validate_path_segment(value: str, label: str) -> str:
     ):
         raise ValueError(f"非法的单级路径参数 {label}: {value!r}")
     return clean
+
+
+def _validate_path_segment(value: str, label: str) -> str:
+    """兼容内部调用的单级路径校验别名。"""
+    return validate_asset_segment(value, label)
 
 
 def make_asset_doc_key(doc_id: str) -> str:
@@ -210,25 +215,16 @@ def _transcode_image_to_png(pil_image_mod: Any, raw_data: bytes) -> bytes | None
         return None
 
 
-def inspect_image_bytes(
+def _decode_and_normalize_image_bytes(
     data: bytes,
     filename_hint: str = "",
     alt: str = "",
+    *,
+    min_dimension: int = 1,
+    min_bytes: int = 1,
 ) -> ExtractedImage | None:
-    """在内存中对图片二进制字节执行完整性校验、尺寸与体积噪点门禁过滤。
-
-    任意宽度 < 100px、高度 < 100px、字节数 < 5KB 或损坏截断的图元均会被丢弃；
-    对非常规栅格格式会自动在内存中转码为标准 PNG，确保 MIME 与实际魔数一致。
-
-    Args:
-        data: 原始图片二进制字节流。
-        filename_hint: 原始内嵌文件名提示（仅用于提取安全基础名称）。
-        alt: 图片语义替代描述文本。
-
-    Returns:
-        校验通过返回 ``ExtractedImage`` 实例；未通过噪点门禁或解码失败返回 ``None``。
-    """
-    if not data or len(data) < MIN_IMAGE_BYTES:
+    """校验图片字节完整性并在尺寸与体积达到门禁时返回标准化 ``ExtractedImage``。"""
+    if not data or len(data) < min_bytes:
         return None
 
     pil_image_mod = _load_pil_image_module()
@@ -241,7 +237,7 @@ def inspect_image_bytes(
         logger.debug("跳过无法解码或已损坏的图片流 (%s): %s", filename_hint or "<unnamed>", exc)
         return None
 
-    if width < MIN_IMAGE_DIMENSION_PX or height < MIN_IMAGE_DIMENSION_PX:
+    if width < min_dimension or height < min_dimension:
         return None
 
     final_data = data
@@ -249,7 +245,7 @@ def inspect_image_bytes(
         ext, mime_type = _FORMAT_METADATA[fmt]
     else:
         transcoded = _transcode_image_to_png(pil_image_mod, data)
-        if not transcoded or len(transcoded) < MIN_IMAGE_BYTES:
+        if not transcoded or len(transcoded) < min_bytes:
             return None
         final_data = transcoded
         ext, mime_type = ".png", "image/png"
@@ -268,7 +264,60 @@ def inspect_image_bytes(
     )
 
 
-def _is_within_dir(target: Path, root: Path) -> bool:
+def inspect_image_bytes(
+    data: bytes,
+    filename_hint: str = "",
+    alt: str = "",
+) -> ExtractedImage | None:
+    """在内存中对图片二进制字节执行完整性校验、尺寸与体积噪点门禁过滤。
+
+    任意宽度 < 100px、高度 < 100px、字节数 < 5KB 或损坏截断的图元均会被丢弃；
+    对非常规栅格格式会自动在内存中转码为标准 PNG，确保 MIME 与实际魔数一致。
+
+    Args:
+        data: 原始图片二进制字节流。
+        filename_hint: 原始内嵌文件名提示（仅用于提取安全基础名称）。
+        alt: 图片语义替代描述文本。
+
+    Returns:
+        校验通过返回 ``ExtractedImage`` 实例；未通过噪点门禁或解码失败返回 ``None``。
+    """
+    return _decode_and_normalize_image_bytes(
+        data,
+        filename_hint=filename_hint,
+        alt=alt,
+        min_dimension=MIN_IMAGE_DIMENSION_PX,
+        min_bytes=MIN_IMAGE_BYTES,
+    )
+
+
+def inspect_explicit_image_bytes(
+    data: bytes,
+    filename_hint: str = "",
+    alt: str = "",
+) -> ExtractedImage | None:
+    """校验文档显式引用图片（如 Markdown 本地相对图片与远程图片）的合法性与 MIME 类型。
+
+    仅校验图片完整性与可解码性（>= 1x1 像素），不应用二进制文档噪点尺寸过滤阈值。
+
+    Args:
+        data: 图片二进制字节流。
+        filename_hint: 原始图片文件名提示。
+        alt: 图片替代文本描述。
+
+    Returns:
+        有效栅格图片返回 ``ExtractedImage``，无法解码返回 ``None``。
+    """
+    return _decode_and_normalize_image_bytes(
+        data,
+        filename_hint=filename_hint,
+        alt=alt,
+        min_dimension=1,
+        min_bytes=1,
+    )
+
+
+def is_within_dir(target: Path, root: Path) -> bool:
     """校验目标路径解析后为根目录的严格真子路径（不含根目录自身），防御路径穿越误删。"""
     try:
         resolved_target = target.resolve()
@@ -278,7 +327,12 @@ def _is_within_dir(target: Path, root: Path) -> bool:
         return False
 
 
-def _resolve_local_storage_path(data_dir: Path, storage_uri: str) -> Path | None:
+def _is_within_dir(target: Path, root: Path) -> bool:
+    """兼容内部调用的路径范围判定别名。"""
+    return is_within_dir(target, root)
+
+
+def resolve_local_storage_path(data_dir: Path, storage_uri: str) -> Path | None:
     """将登记的相对路径或 ``rag://assets/...`` URI 解析为 ``data_dir/assets`` 子路径。"""
     clean_uri = storage_uri.strip().replace("\\", "/")
     if not clean_uri or "\x00" in clean_uri:
@@ -306,6 +360,9 @@ def _resolve_local_storage_path(data_dir: Path, storage_uri: str) -> Path | None
     return candidate
 
 
+_resolve_local_storage_path = resolve_local_storage_path
+
+
 def _prune_empty_dirs(start_dir: Path, stop_root: Path) -> None:
     """自底向上清理空目录，直至并保留 ``stop_root``（如 ``data_dir/assets``）。"""
     curr = start_dir.resolve()
@@ -329,7 +386,7 @@ def _cleanup_registered_assets(
     """按登记清单安全删除本地资产物理文件并修剪空父目录。"""
     for asset in assets or []:
         storage_uri = str(asset.get("storage_uri") or "")
-        local_path = _resolve_local_storage_path(data_dir, storage_uri)
+        local_path = resolve_local_storage_path(data_dir, storage_uri)
         if local_path is not None and local_path.is_file():
             try:
                 local_path.unlink(missing_ok=True)
