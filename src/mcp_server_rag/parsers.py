@@ -15,6 +15,7 @@ import csv
 import io
 import json
 import re
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -401,3 +402,89 @@ def dispatch_and_split(
         return split_structured(content, ext, chunk_size, chunk_overlap)
     else:
         return recursive_split_text(content, chunk_size, chunk_overlap)
+
+
+class HTMLTextExtractor(HTMLParser):
+    """从 HTML 页面中提取网页标题与正文纯文本，滤除脚本、样式与导航视觉噪点。"""
+
+    IGNORED_TAGS: set[str] = {
+        "script",
+        "style",
+        "noscript",
+        "nav",
+        "header",
+        "footer",
+        "svg",
+        "form",
+        "iframe",
+    }
+
+    BLOCK_TAGS: set[str] = {
+        "p",
+        "div",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "li",
+        "br",
+        "section",
+        "article",
+        "table",
+        "tr",
+    }
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title: str = ""
+        self._in_title: bool = False
+        self._ignore_stack: list[str] = []
+        self._pieces: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        tag_lower = tag.lower()
+        if tag_lower == "title":
+            self._in_title = True
+        elif tag_lower in self.IGNORED_TAGS:
+            self._ignore_stack.append(tag_lower)
+
+    def handle_endtag(self, tag: str) -> None:
+        tag_lower = tag.lower()
+        if tag_lower == "title":
+            self._in_title = False
+        elif self._ignore_stack and self._ignore_stack[-1] == tag_lower:
+            self._ignore_stack.pop()
+        elif tag_lower in self.BLOCK_TAGS:
+            self._pieces.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self.title += data.strip()
+        elif not self._ignore_stack:
+            text = data.strip()
+            if text:
+                self._pieces.append(text + " ")
+
+
+def extract_html_content(html: str) -> tuple[str, str]:
+    """提取 HTML 页面的标题与主体清洗正文。
+
+    Args:
+        html: 原始 HTML 文本字符串
+
+    Returns:
+        tuple[str, str]: (页面标题, 清洗后的正文纯文本)
+    """
+    extractor = HTMLTextExtractor()
+    try:
+        extractor.feed(html)
+        extractor.close()
+    except Exception:
+        pass
+
+    raw_text = "".join(extractor._pieces)
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    cleaned_text = "\n\n".join(lines)
+    return extractor.title.strip(), cleaned_text

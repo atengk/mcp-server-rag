@@ -13,12 +13,17 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+import httpx
 from mcp.server import MCPServer
 
 from mcp_server_rag.config import get_settings
 from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalog
-from mcp_server_rag.parsers import dispatch_and_split
+from mcp_server_rag.parsers import (
+    dispatch_and_split,
+    extract_html_content,
+    split_markdown,
+)
 from mcp_server_rag.splitter import recursive_split_text
 from mcp_server_rag.vector_store.chroma import ChromaVectorStoreAdapter
 
@@ -647,6 +652,161 @@ def rag_index_directory(
         "truncated": truncated,
         "files": file_reports,
         "message": msg,
+    }
+
+
+@mcp.tool()
+def rag_index_url(
+    kb_name: str,
+    url: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """通过 HTTP 请求抓取在线网页或在线文档，清洗 HTML 视觉噪点并进行向量索引。
+
+    支持 SHA-256 内容指纹校验与幂等跳过，并具备网络超时与异常防护。
+
+    Args:
+        kb_name: 目标知识库名称
+        url: 目标网页或在线文档的完整 URL（必须以 http:// 或 https:// 开头）
+        metadata: 可选的附加结构化元数据字典
+
+    Returns:
+        dict[str, Any]: 索引结果状态字典
+    """
+    clean_url = url.strip()
+    if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
+        return {
+            "success": False,
+            "message": f"URL 协议无效，必须以 http:// 或 https:// 开头: {url}",
+        }
+
+    settings = get_settings()
+    catalog, vector_store = _get_services()
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return {
+            "success": False,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Antigravity-RAG/0.1.0"
+        )
+    }
+    try:
+        resp = httpx.get(clean_url, headers=headers, timeout=30.0, follow_redirects=True)
+        resp.raise_for_status()
+    except httpx.TimeoutException as exc:
+        return {
+            "success": False,
+            "message": f"请求 URL 网络超时: {exc}",
+        }
+    except httpx.HTTPStatusError as exc:
+        return {
+            "success": False,
+            "message": f"HTTP 请求失败 ({exc.response.status_code}): {exc}",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "message": f"获取 URL 内容失败: {exc}",
+        }
+
+    content_type = resp.headers.get("content-type", "").lower()
+    raw_resp_text = resp.text
+    if "html" in content_type or "<html" in raw_resp_text.lower()[:200]:
+        extracted_title, text_content = extract_html_content(raw_resp_text)
+        fallback_title = clean_url.rstrip("/").split("/")[-1] or clean_url
+        title = extracted_title if extracted_title else fallback_title
+    else:
+        text_content = raw_resp_text.strip()
+        title = clean_url.rstrip("/").split("/")[-1] or clean_url
+
+    if not text_content:
+        return {
+            "success": False,
+            "message": f"URL 页面提取正文为空: {clean_url}",
+        }
+
+    content_hash = hashlib.sha256(text_content.encode("utf-8")).hexdigest()
+    doc_id = clean_url
+
+    # 幂等比对
+    existing = catalog.get_document_by_id(kb_name, doc_id)
+    if existing and existing["content_hash"] == content_hash:
+        return {
+            "success": True,
+            "status": "skipped",
+            "doc_id": doc_id,
+            "url": clean_url,
+            "title": title,
+            "chunk_count": existing["chunk_count"],
+            "content_hash": content_hash,
+            "message": f"URL '{clean_url}' content unchanged, skipped indexing",
+        }
+
+    status = "indexed"
+    if existing:
+        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
+        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+        status = "updated"
+
+    # 切片分发
+    if "markdown" in content_type:
+        chunks = split_markdown(text_content, settings.chunk_size, settings.chunk_overlap)
+    else:
+        chunks = recursive_split_text(text_content, settings.chunk_size, settings.chunk_overlap)
+    if not chunks:
+        chunks = [text_content]
+
+    url_hash = hashlib.md5(clean_url.encode("utf-8")).hexdigest()[:8]
+    chunk_ids = [f"url_{url_hash}_{i}" for i in range(len(chunks))]
+    embedding_provider = get_embedding_provider(settings)
+    embeddings = embedding_provider.embed_texts(chunks)
+
+    user_metadata = metadata or {}
+    metadatas = [
+        {
+            **user_metadata,
+            "doc_id": doc_id,
+            "title": title,
+            "url": clean_url,
+            "source_uri": clean_url,
+            "content_type": content_type,
+            "kb_name": kb_name,
+            "chunk_index": i,
+        }
+        for i in range(len(chunks))
+    ]
+    vector_store.add_chunks(
+        kb_name=kb_name,
+        chunk_ids=chunk_ids,
+        texts=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+
+    catalog.register_document_and_chunks(
+        kb_name=kb_name,
+        doc_id=doc_id,
+        title=title,
+        content_hash=content_hash,
+        source_uri=clean_url,
+        chunk_ids=chunk_ids,
+        file_size=len(text_content.encode("utf-8")),
+    )
+
+    return {
+        "success": True,
+        "status": status,
+        "doc_id": doc_id,
+        "url": clean_url,
+        "title": title,
+        "chunk_count": len(chunks),
+        "content_hash": content_hash,
+        "message": f"URL '{clean_url}' successfully {status}",
     }
 
 
