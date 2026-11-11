@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 from collections.abc import Generator
 from contextlib import closing
@@ -71,7 +72,10 @@ def isolated_env() -> Generator[str, None, None]:
     shutil.rmtree(temp_dir, ignore_errors=True)
 
 
-def test_split_db_env_vars_and_url_precedence(isolated_env: str) -> None:
+def test_split_db_env_vars_and_url_precedence(
+    isolated_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """验证拆分式 DB 环境变量自动拼装与 MCP_RAG_DATABASE_URL 优先级覆盖。"""
     # 1. PostgreSQL 拆分变量与默认端口 5432、密码特殊字符转义（空格编码为 %20）
     os.environ["MCP_RAG_METADATA_STORE"] = "postgresql"
@@ -144,10 +148,12 @@ def test_split_db_env_vars_and_url_precedence(isolated_env: str) -> None:
     with pytest.raises(ValueError, match="unsupported_db"):
         get_metadata_catalog(Settings(metadata_store="unsupported_db"))
 
-    # 6. PostgreSQL/MySQL 在 #14 交付前应抛出清晰的 NotImplementedError
-    with pytest.raises(NotImplementedError):
+    # 6. PostgreSQL/MySQL 工厂已接入：未安装驱动时明确提示可选依赖安装命令
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+    with pytest.raises(ImportError, match=r"\[postgres\]"):
         get_metadata_catalog(Settings(metadata_store="postgresql"))
-    with pytest.raises(NotImplementedError):
+    monkeypatch.setitem(sys.modules, "pymysql", None)
+    with pytest.raises(ImportError, match=r"\[mysql\]"):
         get_metadata_catalog(Settings(metadata_store="mysql"))
 
 

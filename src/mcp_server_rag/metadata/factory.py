@@ -13,6 +13,8 @@ from urllib.parse import unquote, urlparse
 
 from mcp_server_rag.config import Settings
 from mcp_server_rag.metadata.base import MetadataCatalogAdapter
+from mcp_server_rag.metadata.mysql import MySQLMetadataCatalog
+from mcp_server_rag.metadata.postgres import PostgresMetadataCatalog
 from mcp_server_rag.metadata.sqlite import SQLiteMetadataCatalog
 
 SUPPORTED_METADATA_STORES: frozenset[str] = frozenset({"sqlite", "postgresql", "mysql"})
@@ -50,19 +52,19 @@ def get_metadata_catalog(settings: Settings) -> MetadataCatalogAdapter:
         满足 ``MetadataCatalogAdapter`` 协议的元数据目录实例。
 
     Raises:
-        ValueError: 当 ``settings.metadata_store`` 不在支持范围内（如非法引擎名称）时抛出。
-        NotImplementedError: 当选择 ``postgresql`` 或 ``mysql`` 外部引擎但驱动尚未激活时抛出。
+        ValueError: 当 ``settings.metadata_store`` 不支持或外部数据库缺少连接参数时抛出。
+        ImportError: 当选择 ``postgresql`` 或 ``mysql`` 但对应可选依赖驱动未安装时抛出。
     """
     store = (settings.metadata_store or "sqlite").strip().lower()
     if store == "sqlite":
         custom_db_path = _resolve_sqlite_db_path(settings)
         return SQLiteMetadataCatalog(data_dir=settings.data_dir, db_path=custom_db_path)
 
-    if store in {"postgresql", "mysql"}:
-        raise NotImplementedError(
-            f"元数据存储引擎 '{store}' 驱动适配将在下一阶段交付"
-            "（请先使用默认 'sqlite' 或完成后续驱动配置）"
-        )
+    if store == "postgresql":
+        return PostgresMetadataCatalog(dsn=settings.resolved_database_url())
+
+    if store == "mysql":
+        return MySQLMetadataCatalog(dsn=settings.resolved_database_url())
 
     raise ValueError(
         f"不支持的元数据存储引擎 '{settings.metadata_store}'，"
