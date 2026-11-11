@@ -7,9 +7,10 @@
 @since 2026-11-11
 """
 
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 
+@runtime_checkable
 class VectorStoreAdapter(Protocol):
     """向量存储适配器协议接口。"""
 

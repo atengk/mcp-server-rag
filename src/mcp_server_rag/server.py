@@ -25,7 +25,7 @@ from mcp_server_rag.parsers import (
     split_markdown,
 )
 from mcp_server_rag.splitter import recursive_split_text
-from mcp_server_rag.vector_store.chroma import ChromaVectorStoreAdapter
+from mcp_server_rag.vector_store import VectorStoreAdapter, get_vector_store
 
 # 兼容 FastMCP 类型别名
 FastMCP = MCPServer
@@ -35,11 +35,11 @@ READ_ONLY_BLOCK_MSG: str = (
 )
 
 
-def _get_services() -> tuple[MetadataCatalog, ChromaVectorStoreAdapter]:
+def _get_services() -> tuple[MetadataCatalog, VectorStoreAdapter]:
     """获取当前配置对应的元数据目录与向量存储适配器实例。"""
     settings = get_settings()
     catalog = MetadataCatalog(settings.data_dir)
-    vector_store = ChromaVectorStoreAdapter(settings.data_dir)
+    vector_store = get_vector_store(settings)
     return catalog, vector_store
 
 
@@ -292,9 +292,9 @@ def rag_doctor() -> dict[str, Any]:
     settings = get_settings()
     catalog, vector_store = _get_services()
 
-    # 检查 SQLite 与 ChromaDB 连通性
+    # 检查 SQLite 与底层向量存储连通性
     sqlite_ok = catalog.ping()
-    chroma_ok = vector_store.ping()
+    vector_store_ok = vector_store.ping()
 
     # 计算磁盘占用
     disk_usage_bytes = 0
@@ -309,7 +309,7 @@ def rag_doctor() -> dict[str, Any]:
     kb_count = catalog.count_kbs()
     doc_count = catalog.count_documents()
 
-    overall_status = "healthy" if (sqlite_ok and chroma_ok) else "degraded"
+    overall_status = "healthy" if (sqlite_ok and vector_store_ok) else "degraded"
 
     return {
         "status": overall_status,
@@ -317,7 +317,7 @@ def rag_doctor() -> dict[str, Any]:
         "data_dir_size_bytes": disk_usage_bytes,
         "disk_free_bytes": free,
         "vector_store": settings.vector_store,
-        "vector_store_status": "ok" if chroma_ok else "error",
+        "vector_store_status": "ok" if vector_store_ok else "error",
         "metadata_catalog_status": "ok" if sqlite_ok else "error",
         "embedding_provider": settings.embedding_provider,
         "embedding_model": settings.embedding_model,
