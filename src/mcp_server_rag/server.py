@@ -10,6 +10,7 @@ FastMCP 服务主实现模块。
 import hashlib
 import re
 import shutil
+from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
@@ -17,6 +18,7 @@ from mcp.server import MCPServer
 from mcp_server_rag.config import get_settings
 from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalog
+from mcp_server_rag.parsers import dispatch_and_split
 from mcp_server_rag.splitter import recursive_split_text
 from mcp_server_rag.vector_store.chroma import ChromaVectorStoreAdapter
 
@@ -348,6 +350,303 @@ def rag_index_text(
         "chunk_count": len(chunks),
         "content_hash": content_hash,
         "message": f"Document '{title}' successfully {status}",
+    }
+
+
+@mcp.tool()
+def rag_index_file(
+    kb_name: str,
+    file_path: str,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """摄取本地单个文件，自动识别文件格式并进行结构感知切片、向量嵌入与持久化索引。
+
+    支持 SHA-256 内容指纹校验与幂等更新（若文件未修改则秒级跳过）。
+
+    Args:
+        kb_name: 目标知识库名称
+        file_path: 本地文件绝对或相对路径
+        metadata: 可选的附加结构化元数据（标签、分类等）
+
+    Returns:
+        dict[str, Any]: 索引结果状态字典
+    """
+    path = Path(file_path).resolve()
+    if not path.exists():
+        return {"success": False, "message": f"文件不存在: {file_path}"}
+    if not path.is_file():
+        return {"success": False, "message": f"目标路径不是普通文件: {file_path}"}
+
+    try:
+        raw_content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            raw_content = path.read_text(encoding="gbk")
+        except Exception:
+            raw_content = path.read_text(encoding="latin-1", errors="replace")
+
+    if not raw_content or not raw_content.strip():
+        return {"success": False, "message": "文件正文为空"}
+
+    settings = get_settings()
+    catalog, vector_store = _get_services()
+
+    # 1. 校验知识库是否存在
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return {
+            "success": False,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    doc_id = str(path)
+    title = path.name
+    content_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+
+    # 2. 幂等指纹比对
+    existing = catalog.get_document_by_id(kb_name, doc_id)
+    if existing and existing["content_hash"] == content_hash:
+        return {
+            "success": True,
+            "status": "skipped",
+            "doc_id": doc_id,
+            "file_path": str(path),
+            "chunk_count": existing["chunk_count"],
+            "content_hash": content_hash,
+            "message": f"File '{title}' content unchanged, skipped indexing",
+        }
+
+    # 3. 若为更新，先清理旧切片
+    status = "indexed"
+    if existing:
+        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
+        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+        status = "updated"
+
+    # 4. 结构感知语法切片分发
+    chunks = dispatch_and_split(
+        file_path=path,
+        content=raw_content,
+        chunk_size=settings.chunk_size,
+        chunk_overlap=settings.chunk_overlap,
+    )
+    if not chunks:
+        chunks = [raw_content]
+
+    # 5. 生成全局唯一切片 ID 并计算向量嵌入
+    path_hash = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8]
+    chunk_ids = [f"{path.stem}_{path_hash}_{i}" for i in range(len(chunks))]
+    embedding_provider = get_embedding_provider(settings)
+    embeddings = embedding_provider.embed_texts(chunks)
+
+    # 6. 构造元数据并写入向量存储
+    user_metadata = metadata or {}
+    metadatas = [
+        {
+            **user_metadata,
+            "doc_id": doc_id,
+            "title": title,
+            "file_path": str(path),
+            "file_name": path.name,
+            "file_extension": path.suffix.lower(),
+            "kb_name": kb_name,
+            "chunk_index": i,
+        }
+        for i in range(len(chunks))
+    ]
+    vector_store.add_chunks(
+        kb_name=kb_name,
+        chunk_ids=chunk_ids,
+        texts=chunks,
+        embeddings=embeddings,
+        metadatas=metadatas,
+    )
+
+    # 7. 写入元数据目录
+    catalog.register_document_and_chunks(
+        kb_name=kb_name,
+        doc_id=doc_id,
+        title=title,
+        content_hash=content_hash,
+        source_uri=str(path),
+        chunk_ids=chunk_ids,
+        file_size=len(raw_content.encode("utf-8")),
+    )
+
+    return {
+        "success": True,
+        "status": status,
+        "doc_id": doc_id,
+        "file_path": str(path),
+        "chunk_count": len(chunks),
+        "content_hash": content_hash,
+        "message": f"File '{title}' successfully {status}",
+    }
+
+
+IGNORED_DIR_NAMES: set[str] = {
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".rag_data",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".idea",
+    ".vscode",
+}
+
+IGNORED_FILE_EXTENSIONS: set[str] = {
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".bmp",
+    ".ico",
+    ".webp",
+    ".svg",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".7z",
+    ".rar",
+    ".pyc",
+    ".pyo",
+    ".exe",
+    ".dll",
+    ".so",
+    ".dylib",
+    ".bin",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".pdf",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+}
+
+
+@mcp.tool()
+def rag_index_directory(
+    kb_name: str,
+    dir_path: str,
+    glob_pattern: str = "**/*",
+    max_files: int = 200,
+    recursive: bool = True,
+) -> dict[str, Any]:
+    """批量扫描并摄取本地目录下的所有文件，支持递归遍历与 max_files 超时防御截断。
+
+    Args:
+        kb_name: 目标知识库名称
+        dir_path: 目标目录绝对或相对路径
+        glob_pattern: 匹配文件模式（默认为 "**/*"）
+        max_files: 目录文件摄取上限，防止大目录导致 MCP 响应超时（默认 200）
+        recursive: 是否递归扫描子目录（默认 True）
+
+    Returns:
+        dict[str, Any]: 目录批量摄取统计报告字典
+    """
+    path = Path(dir_path).resolve()
+    if not path.exists() or not path.is_dir():
+        return {
+            "success": False,
+            "message": f"目录不存在或不是有效目录: {dir_path}",
+        }
+
+    catalog, _ = _get_services()
+    kb = catalog.get_kb(kb_name)
+    if not kb:
+        return {
+            "success": False,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    # 1. 扫描候选文件
+    candidate_files: list[Path] = []
+    scan_iter = (
+        path.glob(glob_pattern)
+        if "**" in glob_pattern or not recursive
+        else path.rglob(glob_pattern)
+    )
+    for p in scan_iter:
+        if not p.is_file():
+            continue
+        # 排除隐藏目录与特殊忽略目录
+        parts = p.relative_to(path).parts
+        if any(part in IGNORED_DIR_NAMES or part.startswith(".") for part in parts[:-1]):
+            continue
+        # 排除以 . 开头的隐藏文件
+        if p.name.startswith("."):
+            continue
+        # 排除已知二进制或非文本格式
+        if p.suffix.lower() in IGNORED_FILE_EXTENSIONS:
+            continue
+        candidate_files.append(p)
+
+    # 排序以保证多平台遍历结果的一致性
+    candidate_files.sort()
+
+    total_found = len(candidate_files)
+    truncated = False
+    files_to_process = candidate_files
+    if total_found > max_files:
+        files_to_process = candidate_files[:max_files]
+        truncated = True
+
+    # 2. 依次摄取各文件
+    file_reports: list[dict[str, Any]] = []
+    indexed_count = 0
+    updated_count = 0
+    skipped_count = 0
+    failed_count = 0
+
+    for file_p in files_to_process:
+        res = rag_index_file(kb_name=kb_name, file_path=str(file_p))
+        status = res.get("status", "failed") if res.get("success") else "failed"
+        if status == "indexed":
+            indexed_count += 1
+        elif status == "updated":
+            updated_count += 1
+        elif status == "skipped":
+            skipped_count += 1
+        else:
+            failed_count += 1
+
+        file_reports.append(
+            {
+                "file_path": str(file_p),
+                "status": status,
+                "chunk_count": res.get("chunk_count", 0),
+                "message": res.get("message", ""),
+            }
+        )
+
+    msg = (
+        f"目录扫描发现 {total_found} 个候选文件，"
+        f"本次处理 {len(files_to_process)} 个文件 "
+        f"(新增: {indexed_count}, 更新: {updated_count}, "
+        f"跳过: {skipped_count}, 失败: {failed_count})。"
+    )
+    if truncated:
+        msg += f" [警告: 超过 max_files={max_files} 限制，已执行截断]"
+
+    return {
+        "success": True,
+        "dir_path": str(path),
+        "total_found": total_found,
+        "total_indexed": len(files_to_process),
+        "indexed_count": indexed_count,
+        "updated_count": updated_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "truncated": truncated,
+        "files": file_reports,
+        "message": msg,
     }
 
 
