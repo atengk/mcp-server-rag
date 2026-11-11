@@ -517,7 +517,7 @@ def dispatch_and_split(
     """
     ext = file_path.suffix.lower()
 
-    if ext in (".md", ".mdx"):
+    if ext in (".md", ".mdx", ".pdf", ".docx"):
         return split_markdown(content, chunk_size, chunk_overlap)
     elif ext in (".html", ".htm"):
         return split_html(content, chunk_size, chunk_overlap)

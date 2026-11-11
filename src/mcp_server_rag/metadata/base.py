@@ -278,7 +278,7 @@ class MetadataCatalogAdapter(Protocol):
 
         Args:
             kb_name: 所属知识库名称。
-            doc_id: 所属文档唯一标识符。
+            doc_id: 所属文档唯一标识符或其单段目录键（``doc_key``）。
             filename: 图片文件名或相对标识。
 
         Returns:

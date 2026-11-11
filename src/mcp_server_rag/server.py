@@ -18,9 +18,21 @@ from typing import Any
 import httpx
 from mcp.server import MCPServer
 
+from mcp_server_rag.assets import (
+    ExtractedImage,
+    cleanup_document_local_assets,
+    cleanup_kb_local_assets,
+    cleanup_stale_document_assets,
+    persist_local_image_assets,
+)
 from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalogAdapter, get_metadata_catalog
+from mcp_server_rag.office import (
+    ensure_office_dependency,
+    is_office_document,
+    parse_office_document,
+)
 from mcp_server_rag.parsers import (
     build_embedding_text,
     dispatch_and_split,
@@ -118,6 +130,16 @@ class _DocumentIndexSpec:
     chunk_ids: list[str]
     user_metadata: dict[str, Any] | None = None
     extra_metadata: dict[str, Any] | None = None
+    precomputed_embeddings: list[list[float]] | None = None
+
+
+def _compute_file_sha256(file_path: Path, chunk_size: int = 65536) -> str:
+    """分块流式计算任意文件（含大型二进制文档）的 SHA-256 指纹摘要。"""
+    hasher = hashlib.sha256()
+    with file_path.open("rb") as fp:
+        while block := fp.read(chunk_size):
+            hasher.update(block)
+    return hasher.hexdigest()
 
 
 def _persist_indexed_document(
@@ -127,9 +149,12 @@ def _persist_indexed_document(
     doc: _DocumentIndexSpec,
 ) -> None:
     """统一执行 Alt 语义向量构建、图片清单提取、向量写入与元数据链表持久化。"""
-    embedding_provider = get_embedding_provider(settings)
-    embedding_texts = [build_embedding_text(chunk) for chunk in doc.chunks]
-    embeddings = embedding_provider.embed_texts(embedding_texts)
+    if doc.precomputed_embeddings is not None:
+        embeddings = doc.precomputed_embeddings
+    else:
+        embedding_provider = get_embedding_provider(settings)
+        embedding_texts = [build_embedding_text(chunk) for chunk in doc.chunks]
+        embeddings = embedding_provider.embed_texts(embedding_texts)
     chunk_images = [extract_images_from_text(chunk) for chunk in doc.chunks]
 
     base_user_meta = doc.user_metadata or {}
@@ -152,17 +177,24 @@ def _persist_indexed_document(
         embeddings=embeddings,
         metadatas=metadatas,
     )
-    catalog.register_document_and_chunks(
-        kb_name=doc.kb_name,
-        doc_id=doc.doc_id,
-        title=doc.title,
-        content_hash=doc.content_hash,
-        source_uri=doc.source_uri,
-        chunk_ids=doc.chunk_ids,
-        file_size=doc.file_size,
-        chunk_contents=doc.chunks,
-        chunk_images=chunk_images,
-    )
+    try:
+        catalog.register_document_and_chunks(
+            kb_name=doc.kb_name,
+            doc_id=doc.doc_id,
+            title=doc.title,
+            content_hash=doc.content_hash,
+            source_uri=doc.source_uri,
+            chunk_ids=doc.chunk_ids,
+            file_size=doc.file_size,
+            chunk_contents=doc.chunks,
+            chunk_images=chunk_images,
+        )
+    except Exception:
+        try:
+            vector_store.delete_chunks(doc.kb_name, doc.chunk_ids)
+        except Exception as rollback_exc:
+            logger.warning("元数据写入失败后清理刚入库向量失败 (%s): %s", doc.doc_id, rollback_exc)
+        raise
 
 
 def health_check() -> dict[str, str]:
@@ -306,11 +338,13 @@ def rag_clear_kb(name: str) -> dict[str, Any]:
             "message": f"Knowledge base '{name}' not found (知识库不存在)",
         }
 
-    # 1. 清空 SQLite 元数据记录
+    # 1. 记录并清空 SQLite 元数据与本地物理资产
+    kb_assets = catalog.list_image_assets(name)
     catalog.clear_kb(name)
 
-    # 2. 清空向量库数据
+    # 2. 清空向量库数据并清理物理图片文件
     vector_store.clear_kb(name)
+    cleanup_kb_local_assets(settings.data_dir, name, kb_assets)
 
     return {
         "success": True,
@@ -346,11 +380,13 @@ def rag_delete_kb(name: str) -> dict[str, Any]:
             "message": f"Knowledge base '{name}' not found (知识库不存在)",
         }
 
-    # 1. 删除向量集合
+    # 1. 删除向量集合与登记图片资产清单
+    kb_assets = catalog.list_image_assets(name)
     vector_store.delete_kb(name)
 
-    # 2. 删除 SQLite 元数据
+    # 2. 删除 SQLite 元数据并同步清理物理图片资产目录
     catalog.delete_kb(name)
+    cleanup_kb_local_assets(settings.data_dir, name, kb_assets)
 
     return {
         "success": True,
@@ -412,12 +448,14 @@ def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
 
     actual_doc_id = str(doc["id"])
 
-    # 3. 在 SQLite 元数据中删除文档与切片记录并获取切片 ID 列表
+    # 3. 在删除元数据前提取登记的本地资产并原子删除文档与切片记录
+    doc_assets = catalog.list_image_assets(kb_name, doc_id=actual_doc_id)
     deleted_chunk_ids = catalog.delete_document(kb_name, actual_doc_id)
 
-    # 4. 在向量数据库中删除对应向量切片
+    # 4. 在向量数据库中删除对应向量切片并清理本地物理图片资产
     if deleted_chunk_ids:
         vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+    cleanup_document_local_assets(settings.data_dir, kb_name, actual_doc_id, doc_assets)
 
     return {
         "success": True,
@@ -627,18 +665,10 @@ def rag_index_file(
     if not path.is_file():
         return {"success": False, "message": f"目标路径不是普通文件: {file_path}"}
 
-    try:
-        raw_content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            raw_content = path.read_text(encoding="gbk")
-        except Exception:
-            raw_content = path.read_text(encoding="latin-1", errors="replace")
+    is_office = is_office_document(path)
+    if is_office:
+        ensure_office_dependency(path)
 
-    if not raw_content or not raw_content.strip():
-        return {"success": False, "message": "文件正文为空"}
-
-    settings = get_settings()
     catalog, vector_store = _get_services()
 
     # 1. 校验知识库是否存在
@@ -648,7 +678,20 @@ def rag_index_file(
 
     doc_id = str(path)
     title = path.name
-    content_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
+    if is_office:
+        content_hash = _compute_file_sha256(path)
+    else:
+        try:
+            raw_content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                raw_content = path.read_text(encoding="gbk")
+            except Exception:
+                raw_content = path.read_text(encoding="latin-1", errors="replace")
+
+        if not raw_content or not raw_content.strip():
+            return {"success": False, "message": "文件正文为空"}
+        content_hash = hashlib.sha256(raw_content.encode("utf-8")).hexdigest()
 
     # 2. 幂等指纹比对
     existing = catalog.get_document_by_id(kb_name, doc_id)
@@ -663,14 +706,24 @@ def rag_index_file(
             "message": f"File '{title}' content unchanged, skipped indexing",
         }
 
-    # 3. 若为更新，先清理旧切片
-    status = "indexed"
-    if existing:
-        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
-        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
-        status = "updated"
+    extracted_images: list[ExtractedImage] = []
+    if is_office:
+        try:
+            parsed_office = parse_office_document(path, kb_name=kb_name, doc_id=doc_id)
+        except ImportError:
+            raise
+        except Exception as exc:
+            logger.warning("解析二进制文档 '%s' 失败: %s", path.name, exc)
+            return {"success": False, "message": f"解析文档 '{title}' 失败: {exc}"}
+        raw_content = parsed_office.markdown_text
+        extracted_images = parsed_office.images
+        if not raw_content or not raw_content.strip():
+            return {"success": False, "message": "文档未提取到有效文本或图片内容"}
+        file_size = path.stat().st_size
+    else:
+        file_size = len(raw_content.encode("utf-8"))
 
-    # 4. 结构感知语法切片分发
+    # 3. 先完成结构感知切片与向量计算，确保失败时不误删存量版本及资产
     chunks = dispatch_and_split(
         file_path=path,
         content=raw_content,
@@ -680,7 +733,20 @@ def rag_index_file(
     if not chunks:
         chunks = [raw_content]
 
-    # 5. 生成全局唯一切片 ID 并协同持久化至向量库与元数据目录
+    embedding_provider = get_embedding_provider(settings)
+    embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
+    precomputed_embeddings = embedding_provider.embed_texts(embedding_texts)
+
+    # 4. 清理旧版本记录与旧向量（陈旧物理图片待新版本落盘及登记成功后再行裁剪）
+    status = "indexed"
+    old_assets: list[dict[str, Any]] = []
+    if existing:
+        old_assets = catalog.list_image_assets(kb_name, doc_id=doc_id)
+        deleted_chunk_ids = catalog.delete_document(kb_name, doc_id)
+        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+        status = "updated"
+
+    # 5. 生成全局唯一切片 ID 并协同持久化至向量库、元数据目录与本地图片资产
     path_hash = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8]
     chunk_ids = [f"{path.stem}_{path_hash}_{i}" for i in range(len(chunks))]
     _persist_indexed_document(
@@ -693,7 +759,7 @@ def rag_index_file(
             title=title,
             content_hash=content_hash,
             source_uri=str(path),
-            file_size=len(raw_content.encode("utf-8")),
+            file_size=file_size,
             chunks=chunks,
             chunk_ids=chunk_ids,
             user_metadata=metadata,
@@ -702,8 +768,40 @@ def rag_index_file(
                 "file_name": path.name,
                 "file_extension": path.suffix.lower(),
             },
+            precomputed_embeddings=precomputed_embeddings,
         ),
     )
+
+    written_assets: list[dict[str, Any]] = []
+    try:
+        if extracted_images:
+            written_assets = persist_local_image_assets(
+                settings.data_dir,
+                kb_name,
+                doc_id,
+                extracted_images,
+            )
+            catalog.register_image_assets(kb_name, doc_id, written_assets)
+    except Exception:
+        # 补偿回滚：撤回本轮已提交文档与向量切片及部分落盘图片，防止后续重试误判 skipped
+        try:
+            rolled_chunk_ids = catalog.delete_document(kb_name, doc_id)
+            vector_store.delete_chunks(kb_name, rolled_chunk_ids or chunk_ids)
+        except Exception as rollback_exc:
+            logger.warning("索引资产失败回滚元数据/向量库异常 (%s): %s", doc_id, rollback_exc)
+        cleanup_document_local_assets(
+            settings.data_dir,
+            kb_name,
+            doc_id,
+            old_assets + written_assets,
+        )
+        raise
+
+    if existing and old_assets:
+        if not extracted_images:
+            cleanup_document_local_assets(settings.data_dir, kb_name, doc_id, old_assets)
+        else:
+            cleanup_stale_document_assets(settings.data_dir, old_assets, written_assets)
 
     return {
         "success": True,
@@ -756,8 +854,6 @@ IGNORED_FILE_EXTENSIONS: set[str] = {
     ".db",
     ".sqlite",
     ".sqlite3",
-    ".pdf",
-    ".docx",
     ".xlsx",
     ".pptx",
 }
@@ -841,7 +937,10 @@ def rag_index_directory(
     failed_count = 0
 
     for file_p in files_to_process:
-        res = rag_index_file(kb_name=kb_name, file_path=str(file_p))
+        try:
+            res = rag_index_file(kb_name=kb_name, file_path=str(file_p))
+        except ImportError as exc:
+            res = {"success": False, "message": str(exc)}
         status = res.get("status", "failed") if res.get("success") else "failed"
         if status == "indexed":
             indexed_count += 1

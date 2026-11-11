@@ -11,7 +11,6 @@
 
 import json
 import logging
-import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
@@ -19,6 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from mcp_server_rag.assets import make_asset_doc_key, make_asset_id
 from mcp_server_rag.metadata.base import (
     CHUNK_QUERY_BATCH_SIZE,
     CHUNK_SELECT_COLUMNS,
@@ -505,6 +505,7 @@ class _RelationalMetadataCatalog(ABC):
         if not assets:
             return
         now = datetime.now(timezone.utc).isoformat()
+        doc_key = make_asset_doc_key(doc_id)
         with self._get_cursor() as cursor:
             for asset in assets:
                 filename = str(asset.get("filename") or "").strip()
@@ -514,7 +515,7 @@ class _RelationalMetadataCatalog(ABC):
                 mime_type = str(asset.get("mime_type") or "application/octet-stream")
                 byte_size = max(0, int(asset.get("byte_size") or 0))
                 created_at = str(asset.get("created_at") or now)
-                asset_id = str(asset.get("asset_id") or uuid.uuid4())
+                asset_id = str(asset.get("asset_id") or make_asset_id(kb_name, doc_key, filename))
 
                 cursor.execute(
                     """
@@ -543,7 +544,7 @@ class _RelationalMetadataCatalog(ABC):
         doc_id: str,
         filename: str,
     ) -> dict[str, Any] | None:
-        """按文档与文件名查询单条图片资产记录。"""
+        """按文档 ID（或单段目录键 ``doc_key``）与文件名查询单条图片资产记录。"""
         with self._get_cursor() as cursor:
             cursor.execute(
                 """
@@ -555,6 +556,18 @@ class _RelationalMetadataCatalog(ABC):
                 (kb_name, doc_id, filename),
             )
             row = cursor.fetchone()
+            if row is None and doc_id:
+                candidate_asset_id = make_asset_id(kb_name, doc_id, filename)
+                cursor.execute(
+                    """
+                    SELECT asset_id, kb_name, doc_id, filename, storage_uri,
+                           mime_type, byte_size, created_at
+                    FROM image_assets
+                    WHERE asset_id = %s AND kb_name = %s AND filename = %s
+                    """,
+                    (candidate_asset_id, kb_name, filename),
+                )
+                row = cursor.fetchone()
             return self._normalize_asset_row(self._row_to_dict(cursor, row)) if row else None
 
     def list_image_assets(
