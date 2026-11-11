@@ -196,6 +196,70 @@ def rag_delete_kb(name: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
+    """从指定知识库中物理删除特定文档及其所有切片与向量索引。
+
+    支持按文档 ID、标题或文件路径精确匹配。
+
+    Args:
+        kb_name: 目标知识库名称
+        doc_id: 待删除的文档 ID、标题或文件路径
+
+    Returns:
+        dict[str, Any]: 删除操作结果状态字典
+    """
+    clean_doc = doc_id.strip() if doc_id else ""
+    if not clean_doc:
+        return {
+            "success": False,
+            "kb_name": kb_name,
+            "doc_id": doc_id,
+            "message": "文档标识 (doc_id) 不能为空",
+        }
+
+    catalog, vector_store = _get_services()
+
+    # 1. 校验知识库是否存在
+    if not catalog.get_kb(kb_name):
+        return {
+            "success": False,
+            "kb_name": kb_name,
+            "doc_id": doc_id,
+            "message": f"Knowledge base '{kb_name}' not found (知识库不存在)",
+        }
+
+    # 2. 匹配目标文档
+    doc = catalog.find_document(kb_name, clean_doc)
+    if not doc:
+        return {
+            "success": False,
+            "kb_name": kb_name,
+            "doc_id": doc_id,
+            "message": f"Document '{doc_id}' not found in knowledge base '{kb_name}' (文档不存在)",
+        }
+
+    actual_doc_id = str(doc["id"])
+
+    # 3. 在 SQLite 元数据中删除文档与切片记录并获取切片 ID 列表
+    deleted_chunk_ids = catalog.delete_document(kb_name, actual_doc_id)
+
+    # 4. 在向量数据库中删除对应向量切片
+    if deleted_chunk_ids:
+        vector_store.delete_chunks(kb_name, deleted_chunk_ids)
+
+    return {
+        "success": True,
+        "kb_name": kb_name,
+        "doc_id": actual_doc_id,
+        "deleted_chunks_count": len(deleted_chunk_ids),
+        "message": (
+            f"Document '{actual_doc_id}' and {len(deleted_chunk_ids)} chunk(s) "
+            f"successfully deleted from knowledge base '{kb_name}'"
+        ),
+    }
+
+
+@mcp.tool()
 def rag_doctor() -> dict[str, Any]:
     """全维自检诊断探针，检查存储引擎连通性、本地模型配置、磁盘占用与系统环境。
 
@@ -844,19 +908,56 @@ def _build_chroma_where_document(keyword: str | None) -> dict[str, Any] | None:
     return {"$or": [{"$contains": c} for c in cases]}
 
 
+def _resolve_target_kbs(
+    catalog: MetadataCatalog,
+    kb_name: str | list[str],
+) -> tuple[list[str], bool]:
+    """解析目标知识库清单并标识是否为跨库联合检索模式。
+
+    Args:
+        catalog: SQLite 元数据目录实例
+        kb_name: 单知识库名称、知识库列表或通配符 "*"
+
+    Returns:
+        tuple[list[str], bool]: (有效知识库名称列表, 是否为跨库模式)
+    """
+    existing_kbs = {kb["name"] for kb in catalog.list_kbs()}
+    if not existing_kbs:
+        return [], False
+
+    if isinstance(kb_name, str):
+        trimmed = kb_name.strip()
+        if trimmed == "*":
+            return [kb["name"] for kb in catalog.list_kbs()], True
+        if trimmed in existing_kbs:
+            return [trimmed], False
+        return [], False
+
+    if isinstance(kb_name, list):
+        if "*" in kb_name:
+            return [kb["name"] for kb in catalog.list_kbs()], True
+        target_list: list[str] = []
+        for item in kb_name:
+            if isinstance(item, str) and item.strip() in existing_kbs:
+                target_list.append(item.strip())
+        return target_list, True
+
+    return [], False
+
+
 @mcp.tool()
 def rag_search(
-    kb_name: str,
+    kb_name: str | list[str],
     query: str,
     top_k: int = 5,
     threshold: float = 0.0,
     keyword: str | None = None,
     metadata_filter: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """在指定知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与元数据过滤。
+    """在指定知识库或跨多个知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与元数据过滤。
 
     Args:
-        kb_name: 目标知识库名称
+        kb_name: 目标知识库名称，支持单库名称、知识库列表（如 ["docs", "code"]）或 "*" 跨全库召回
         query: 检索查询文本
         top_k: 返回相似切片的最大数量（默认为 5）
         threshold: 相似度截断阈值，过滤掉低于此分数的切片（范围 0.0 ~ 1.0）
@@ -873,9 +974,9 @@ def rag_search(
     settings = get_settings()
     catalog, vector_store = _get_services()
 
-    # 1. 校验知识库是否存在
-    kb = catalog.get_kb(kb_name)
-    if not kb:
+    # 1. 解析目标知识库清单
+    target_kbs, _ = _resolve_target_kbs(catalog, kb_name)
+    if not target_kbs:
         return []
 
     # 2. 构造底层向量数据库过滤条件
@@ -886,44 +987,50 @@ def rag_search(
     embedding_provider = get_embedding_provider(settings)
     query_vector = embedding_provider.embed_query(query.strip())
 
-    # 4. 执行向量检索召回候选切片
-    candidates = vector_store.search(
-        kb_name=kb_name,
-        query_embedding=query_vector,
-        top_k=top_k,
-        where=where,
-        where_document=where_document,
-    )
-
-    # 5. 精确过滤（阈值截断、关键词与元数据二次校验）
-    filtered: list[dict[str, Any]] = []
+    # 4. 执行向量检索召回候选切片并按库收集
     clean_kw = keyword.strip().lower() if keyword and keyword.strip() else None
+    all_filtered: list[dict[str, Any]] = []
 
-    for item in candidates:
-        # 相似度阈值过滤
-        if item["score"] < threshold:
-            continue
-        # 精准关键词严格匹配验证
-        if clean_kw and clean_kw not in item["text"].lower():
-            continue
-        # 元数据严格匹配二次校验
-        if metadata_filter:
-            item_meta = item.get("metadata", {})
-            match = True
-            for mk, mv in metadata_filter.items():
-                if not mk.startswith("$") and item_meta.get(mk) != mv:
-                    match = False
-                    break
-            if not match:
+    for target_kb in target_kbs:
+        candidates = vector_store.search(
+            kb_name=target_kb,
+            query_embedding=query_vector,
+            top_k=top_k,
+            where=where,
+            where_document=where_document,
+        )
+
+        for item in candidates:
+            # 保证返回切片根节点与 metadata 均显式携带所属 kb_name
+            item["kb_name"] = target_kb
+            item_meta = item.setdefault("metadata", {})
+            item_meta["kb_name"] = target_kb
+
+            # 相似度阈值过滤
+            if item["score"] < threshold:
                 continue
-        filtered.append(item)
+            # 精准关键词严格匹配验证
+            if clean_kw and clean_kw not in item["text"].lower():
+                continue
+            # 元数据严格匹配二次校验
+            if metadata_filter:
+                match = True
+                for mk, mv in metadata_filter.items():
+                    if not mk.startswith("$") and item_meta.get(mk) != mv:
+                        match = False
+                        break
+                if not match:
+                    continue
+            all_filtered.append(item)
 
-    return filtered[:top_k]
+    # 5. 全局综合评分降序重排并截取 Top-K
+    all_filtered.sort(key=lambda x: x["score"], reverse=True)
+    return all_filtered[:top_k]
 
 
 @mcp.tool()
 def rag_query_with_context(
-    kb_name: str,
+    kb_name: str | list[str],
     query: str,
     top_k: int = 5,
     threshold: float = 0.0,
@@ -933,7 +1040,7 @@ def rag_query_with_context(
     """检索知识库相关上下文并组装为带来源引用的 Markdown 增强提示词。
 
     Args:
-        kb_name: 目标知识库名称
+        kb_name: 目标知识库名称（支持单库名、知识库名称列表或通配符 "*" 跨库检索）
         query: 检索查询问题或主题
         top_k: 返回参考切片的最大数量（默认为 5）
         threshold: 相似度截断阈值，过滤掉低于此分数的切片
@@ -955,16 +1062,25 @@ def rag_query_with_context(
     if not chunks:
         return "未检索到与查询相关的上下文内容。"
 
+    is_cross = kb_name == "*" or isinstance(kb_name, list)
+
     context_sections: list[str] = ["根据以下检索到的相关知识库参考资料回答问题：\n"]
     for i, chunk in enumerate(chunks, 1):
         meta = chunk.get("metadata", {})
         title = meta.get("title") or meta.get("doc_id") or chunk.get("chunk_id", f"文档_{i}")
         score = chunk.get("score", 0.0)
+        source_kb = chunk.get("kb_name") or meta.get("kb_name", "")
         raw_text = chunk.get("text", "").strip()
         quoted_text = (
             "\n".join(f"> {line}" for line in raw_text.splitlines()) if raw_text else "> (空内容)"
         )
-        section = f"### 📚 参考片段 [{i}] (来源: {title}, 相似度: {score:.4f})\n{quoted_text}\n"
+        if is_cross and source_kb:
+            section = (
+                f"### 📚 参考片段 [{i}] (来源: {title} [知识库: {source_kb}], "
+                f"相似度: {score:.4f})\n{quoted_text}\n"
+            )
+        else:
+            section = f"### 📚 参考片段 [{i}] (来源: {title}, 相似度: {score:.4f})\n{quoted_text}\n"
         context_sections.append(section)
 
     return "\n".join(context_sections).strip()

@@ -195,6 +195,41 @@ class MetadataCatalog:
             row = cursor.fetchone()
             return dict(row) if row else None
 
+    def find_document(self, kb_name: str, doc_identifier: str) -> dict[str, Any] | None:
+        """多策略查找文档：支持按文档 ID、标题、源路径智能匹配。"""
+        clean_id = doc_identifier.strip()
+        if not clean_id:
+            return None
+
+        # 1. 精确匹配主键 ID
+        doc = self.get_document_by_id(kb_name, clean_id)
+        if doc:
+            return doc
+
+        # 2. 尝试本地路径解析匹配
+        try:
+            resolved_str = str(Path(clean_id).resolve())
+            doc = self.get_document_by_id(kb_name, resolved_str)
+            if doc:
+                return doc
+        except Exception:
+            pass
+
+        # 3. 按 source_uri 或 title 匹配
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, kb_name, title, content_hash, source_uri, chunk_count, file_size,
+                       created_at, updated_at
+                FROM documents
+                WHERE kb_name = ? AND (source_uri = ? OR title = ?)
+                """,
+                (kb_name, clean_id, clean_id),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def delete_document(self, kb_name: str, doc_id: str) -> list[str]:
         """删除指定文档及其切片记录，返回被删除的切片 ID 列表。"""
         with self._get_connection() as conn:
