@@ -27,6 +27,7 @@ from mcp_server_rag.assets import (
 )
 from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
+from mcp_server_rag.hybrid_search import HybridSearchOptions, execute_hybrid_search
 from mcp_server_rag.metadata import MetadataCatalogAdapter, get_metadata_catalog
 from mcp_server_rag.office import (
     ensure_office_dependency,
@@ -1429,7 +1430,13 @@ def _expand_and_deduplicate_hits(
         for cluster in clusters:
             expanded_results.append(_materialize_cluster(cluster, by_id, pos_by_id))
 
-    expanded_results.sort(key=lambda x: float(x.get("score") or 0.0), reverse=True)
+    expanded_results.sort(
+        key=lambda x: (
+            float(x.get("score") or 0.0),
+            float((x.get("metadata") or {}).get("rrf_score") or 0.0),
+        ),
+        reverse=True,
+    )
     return expanded_results
 
 
@@ -1442,7 +1449,7 @@ def rag_search(
     metadata_filter: dict[str, Any] | None = None,
     expand_context: int = 0,
 ) -> list[dict[str, Any]]:
-    """在指定知识库或跨多个知识库中执行高维向量语义搜索，支持阈值过滤、精准关键词过滤与上下文扩展。
+    """在指定知识库或跨多个知识库中执行向量语义检索与原生 FTS 倒排混合检索（RRF 融合）。
 
     Args:
         kb_name: 目标知识库名称，支持单库名称、知识库列表（如 ["docs", "code"]）或 "*" 跨全库召回
@@ -1476,45 +1483,25 @@ def rag_search(
     embedding_provider = get_embedding_provider(settings)
     query_vector = embedding_provider.embed_query(query.strip())
 
-    # 4. 执行向量检索召回候选切片并按库收集
-    clean_kw = keyword.strip().lower() if keyword and keyword.strip() else None
-    all_filtered: list[dict[str, Any]] = []
-
-    for target_kb in target_kbs:
-        candidates = vector_store.search(
-            kb_name=target_kb,
-            query_embedding=query_vector,
+    # 4. 执行向量检索 + 原生数据库 FTS 倒排双路召回与 RRF 融合重排
+    fused_hits = execute_hybrid_search(
+        catalog=catalog,
+        vector_store=vector_store,
+        target_kbs=target_kbs,
+        query=query,
+        query_vector=query_vector,
+        options=HybridSearchOptions(
             top_k=top_k,
+            threshold=threshold,
+            keyword=keyword,
+            metadata_filter=metadata_filter,
             where=where,
             where_document=where_document,
-        )
+        ),
+    )
 
-        for item in candidates:
-            # 保证返回切片根节点与 metadata 均显式携带所属 kb_name
-            item["kb_name"] = target_kb
-            item_meta = item.setdefault("metadata", {})
-            item_meta["kb_name"] = target_kb
-
-            # 相似度阈值过滤
-            if item["score"] < threshold:
-                continue
-            # 精准关键词严格匹配验证
-            if clean_kw and clean_kw not in item["text"].lower():
-                continue
-            # 元数据严格匹配二次校验
-            if metadata_filter:
-                match = True
-                for mk, mv in metadata_filter.items():
-                    if not mk.startswith("$") and item_meta.get(mk) != mv:
-                        match = False
-                        break
-                if not match:
-                    continue
-            all_filtered.append(item)
-
-    # 5. 全局综合评分降序重排并截取 Top-K，补充结构化图片元数据与按需上下文展开
-    all_filtered.sort(key=lambda x: x["score"], reverse=True)
-    top_hits = _hydrate_hits_images(catalog, all_filtered[:top_k])
+    # 5. 补充结构化图片元数据并按需执行双向链表上下文扩展
+    top_hits = _hydrate_hits_images(catalog, fused_hits)
     window = _normalize_expand_context(expand_context)
     if window > 0:
         return _expand_and_deduplicate_hits(catalog, top_hits, window)

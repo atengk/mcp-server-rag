@@ -151,7 +151,20 @@ class _FakeCursor:
             raise exc
         translated = self._harness.translate_sql(sql)
         if translated:
-            self._inner.execute(translated, bound)
+            try:
+                self._inner.execute(translated, bound)
+            except sqlite3.OperationalError as exc:
+                is_dup_col = (
+                    "ADD COLUMN IF NOT EXISTS" in sql.upper()
+                    and "duplicate column name" in str(exc)
+                )
+                if is_dup_col:
+                    return
+                raise
+
+    def executemany(self, sql: str, seq_of_params: list[tuple[Any, ...]]) -> None:
+        for params in seq_of_params:
+            self.execute(sql, params)
 
     def fetchone(self) -> Any:
         return self._inner.fetchone()
@@ -224,6 +237,44 @@ class _FakeDBHarness:
             text = "\n".join(lines)
 
         text = text.replace("%s", "?")
+        text = text.replace("to_tsvector('simple', ?)", "?")
+        upper_text = text.upper()
+        if "ADD COLUMN IF NOT EXISTS CONTENT_TSV TSVECTOR" in upper_text:
+            return "ALTER TABLE chunks ADD COLUMN content_tsv TEXT"
+        if "USING GIN" in upper_text:
+            return re.sub(
+                r"\s+ON\s+chunks\s+USING\s+GIN\s*\(",
+                " ON chunks (",
+                text,
+                flags=re.IGNORECASE,
+            )
+        if upper_text.startswith("SHOW INDEX FROM CHUNKS"):
+            return (
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'index' AND name = 'idx_chunks_content_ft'"
+            )
+        if "ADD FULLTEXT INDEX IDX_CHUNKS_CONTENT_FT" in upper_text:
+            return "CREATE INDEX IF NOT EXISTS idx_chunks_content_ft ON chunks (content)"
+        if "TS_RANK_CD(" in upper_text:
+            text = text.replace(
+                "ts_rank_cd(c.content_tsv, to_tsquery('simple', ?))",
+                "CASE WHEN ? != '' THEN 1.0 ELSE 0.0 END",
+            )
+            text = text.replace(
+                "c.content_tsv @@ to_tsquery('simple', ?)",
+                "(? != '' AND c.content != '')",
+            )
+            return text
+        if "MATCH(C.CONTENT) AGAINST" in upper_text:
+            text = text.replace(
+                "MATCH(c.content) AGAINST (? IN NATURAL LANGUAGE MODE) AS fts_score",
+                "CASE WHEN ? != '' THEN 1.0 ELSE 0.0 END AS fts_score",
+            )
+            text = text.replace(
+                "MATCH(c.content) AGAINST (? IN NATURAL LANGUAGE MODE)",
+                "(? != '' AND c.content != '')",
+            )
+            return text
         if "ON DUPLICATE KEY UPDATE" in text:
             if "INTO documents" in text:
                 text = text.replace("ON DUPLICATE KEY UPDATE", "ON CONFLICT(id) DO UPDATE SET")

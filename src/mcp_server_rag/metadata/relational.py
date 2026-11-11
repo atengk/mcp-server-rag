@@ -23,7 +23,9 @@ from mcp_server_rag.metadata.base import (
     CHUNK_QUERY_BATCH_SIZE,
     CHUNK_SELECT_COLUMNS,
     deduplicate_chunk_ids,
+    merge_fts_batch_hits,
     normalize_chunk_row,
+    normalize_fts_hit_row,
 )
 
 logger = logging.getLogger(__name__)
@@ -167,6 +169,23 @@ class _RelationalMetadataCatalog(ABC):
         with self._get_cursor() as cursor:
             for ddl in self._ddl_statements:
                 cursor.execute(ddl)
+            self._post_init_schema(cursor)
+
+    def _post_init_schema(self, cursor: Any) -> None:
+        """供子类在基础表创建后执行全文索引初始化及存量迁移（默认无操作）。"""
+
+    def _upsert_chunk_row(self, cursor: Any, params: tuple[Any, ...]) -> None:
+        """写入单条切片记录，子类可覆写以同步维护数据库原生 FTS 字段。"""
+        cursor.execute(
+            """
+            INSERT INTO chunks (
+                id, kb_name, doc_id, chunk_index, content,
+                prev_chunk_id, next_chunk_id, images_json, created_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            params,
+        )
 
     @abstractmethod
     def _insert_kb_row(self, cursor: Any, params: tuple[Any, ...]) -> bool:
@@ -421,14 +440,8 @@ class _RelationalMetadataCatalog(ABC):
                     else []
                 )
                 images_json = json.dumps(images_list, ensure_ascii=False)
-                cursor.execute(
-                    """
-                    INSERT INTO chunks (
-                        id, kb_name, doc_id, chunk_index, content,
-                        prev_chunk_id, next_chunk_id, images_json, created_at
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
+                self._upsert_chunk_row(
+                    cursor,
                     (
                         c_id,
                         kb_name,
@@ -494,6 +507,55 @@ class _RelationalMetadataCatalog(ABC):
             return [
                 normalize_chunk_row(self._row_to_dict(cursor, row)) for row in cursor.fetchall()
             ]
+
+    def _execute_fts_query(
+        self,
+        clean_kbs: list[str],
+        score_expr: str,
+        score_params: tuple[Any, ...],
+        match_clause: str,
+        where_params: tuple[Any, ...],
+        order_clause: str,
+        top_k: int,
+    ) -> list[dict[str, Any]]:
+        """执行关系型数据库全文检索通用模板查询并标准化返回结果。"""
+        hits: list[dict[str, Any]] = []
+        batch_count = 0
+        with self._get_cursor() as cursor:
+            for start in range(0, len(clean_kbs), CHUNK_QUERY_BATCH_SIZE):
+                batch_count += 1
+                kb_batch = clean_kbs[start : start + CHUNK_QUERY_BATCH_SIZE]
+                placeholders = ", ".join("%s" for _ in kb_batch)
+                cursor.execute(
+                    f"""
+                    SELECT c.id, c.kb_name, c.doc_id, c.chunk_index, c.content,
+                           c.prev_chunk_id, c.next_chunk_id, c.images_json, c.created_at,
+                           d.title AS doc_title, d.source_uri AS doc_source_uri,
+                           {score_expr} AS fts_score
+                    FROM chunks c
+                    LEFT JOIN documents d ON c.doc_id = d.id AND c.kb_name = d.kb_name
+                    WHERE c.kb_name IN ({placeholders})
+                      AND {match_clause}
+                    ORDER BY {order_clause}
+                    LIMIT %s
+                    """,
+                    (*score_params, *kb_batch, *where_params, top_k),
+                )
+                hits.extend(
+                    normalize_fts_hit_row(self._row_to_dict(cursor, row))
+                    for row in cursor.fetchall()
+                )
+
+        return merge_fts_batch_hits(hits, batch_count=batch_count, top_k=top_k)
+
+    @abstractmethod
+    def search_chunks_fts(
+        self,
+        kb_names: list[str],
+        query: str,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """在目标关系型知识库切片表中执行原生全文检索（子类需按方言实现）。"""
 
     def register_image_assets(
         self,

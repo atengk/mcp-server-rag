@@ -19,11 +19,15 @@ from pathlib import Path
 from typing import Any
 
 from mcp_server_rag.assets import make_asset_doc_key, make_asset_id
+from mcp_server_rag.fts import build_sqlite_fts5_query, tokenize_fts_text
 from mcp_server_rag.metadata.base import (
     CHUNK_QUERY_BATCH_SIZE,
     CHUNK_SELECT_COLUMNS,
     deduplicate_chunk_ids,
+    merge_fts_batch_hits,
     normalize_chunk_row,
+    normalize_fts_hit_row,
+    normalize_kb_names,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,6 +44,7 @@ _ALLOWED_MIGRATION_COLUMNS: frozenset[str] = frozenset(
         "prev_chunk_id",
         "next_chunk_id",
         "images_json",
+        "created_at",
     }
 )
 
@@ -191,9 +196,39 @@ class SQLiteMetadataCatalog:
                     ("prev_chunk_id", "TEXT DEFAULT NULL"),
                     ("next_chunk_id", "TEXT DEFAULT NULL"),
                     ("images_json", "TEXT NOT NULL DEFAULT '[]'"),
+                    ("created_at", "TEXT NOT NULL DEFAULT ''"),
                 ],
             )
+            self._ensure_fts_schema(cursor)
             conn.commit()
+
+    def _ensure_fts_schema(self, cursor: sqlite3.Cursor) -> None:
+        """创建 SQLite FTS5 全文检索虚表并幂等回填存量切片倒排索引。"""
+        cursor.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                chunk_id UNINDEXED,
+                kb_name UNINDEXED,
+                doc_id UNINDEXED,
+                tokens,
+                tokenize="unicode61 tokenchars '_'"
+            )
+            """
+        )
+        cursor.execute("SELECT chunk_id FROM chunks_fts")
+        indexed_ids = {str(row[0]) for row in cursor.fetchall()}
+        cursor.execute("SELECT id, kb_name, doc_id, content FROM chunks WHERE content != ''")
+        missing_rows = [
+            (str(row[0]), str(row[1]), str(row[2]), tokenize_fts_text(str(row[3])))
+            for row in cursor.fetchall()
+            if str(row[0]) not in indexed_ids
+        ]
+        if missing_rows:
+            cursor.executemany(
+                "INSERT INTO chunks_fts (chunk_id, kb_name, doc_id, tokens) VALUES (?, ?, ?, ?)",
+                missing_rows,
+            )
+            logger.info("已为存量 %d 条切片自动补建 SQLite FTS5 倒排索引", len(missing_rows))
 
     def create_kb(
         self,
@@ -291,6 +326,7 @@ class SQLiteMetadataCatalog:
         now = datetime.now(timezone.utc).isoformat()
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("DELETE FROM chunks_fts WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM image_assets WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM chunks WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM documents WHERE kb_name = ?", (name,))
@@ -327,6 +363,7 @@ class SQLiteMetadataCatalog:
             return False
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute("DELETE FROM chunks_fts WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM image_assets WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM chunks WHERE kb_name = ?", (name,))
             cursor.execute("DELETE FROM documents WHERE kb_name = ?", (name,))
@@ -412,6 +449,10 @@ class SQLiteMetadataCatalog:
             chunk_ids = [str(row[0]) for row in cursor.fetchall()]
 
             cursor.execute(
+                "DELETE FROM chunks_fts WHERE kb_name = ? AND doc_id = ?",
+                (kb_name, doc_id),
+            )
+            cursor.execute(
                 "DELETE FROM image_assets WHERE kb_name = ? AND doc_id = ?",
                 (kb_name, doc_id),
             )
@@ -474,11 +515,16 @@ class SQLiteMetadataCatalog:
                     now,
                 ),
             )
-            # 2. 先清理旧切片再按新序列写入上下文指针、正文与关联图片，避免缩减分片时残留脏切片
+            # 2. 先清理旧切片及 FTS 索引再重写，避免缩减分片或更新文本时残留脏数据
+            cursor.execute(
+                "DELETE FROM chunks_fts WHERE kb_name = ? AND doc_id = ?",
+                (kb_name, doc_id),
+            )
             cursor.execute(
                 "DELETE FROM chunks WHERE kb_name = ? AND doc_id = ?",
                 (kb_name, doc_id),
             )
+            fts_rows: list[tuple[str, str, str, str]] = []
             for idx, c_id in enumerate(chunk_ids):
                 prev_chunk_id = chunk_ids[idx - 1] if idx > 0 else None
                 next_chunk_id = chunk_ids[idx + 1] if idx + 1 < total_chunks else None
@@ -519,6 +565,13 @@ class SQLiteMetadataCatalog:
                         images_json,
                         now,
                     ),
+                )
+                fts_rows.append((c_id, kb_name, doc_id, tokenize_fts_text(chunk_text)))
+            if fts_rows:
+                cursor.executemany(
+                    "INSERT INTO chunks_fts (chunk_id, kb_name, doc_id, tokens) "
+                    "VALUES (?, ?, ?, ?)",
+                    fts_rows,
                 )
             cursor.execute(
                 "UPDATE knowledge_bases SET updated_at = ? WHERE name = ?",
@@ -572,6 +625,49 @@ class SQLiteMetadataCatalog:
                 (kb_name, doc_id),
             )
             return [normalize_chunk_row(dict(row)) for row in cursor.fetchall()]
+
+    def search_chunks_fts(
+        self,
+        kb_names: list[str],
+        query: str,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """基于 SQLite FTS5 虚表执行倒排关键词召回并按 BM25 相关性排序。"""
+        clean_kbs = normalize_kb_names(kb_names)
+        if not clean_kbs or top_k <= 0:
+            return []
+
+        fts_query = build_sqlite_fts5_query(query)
+        if not fts_query:
+            return []
+
+        hits: list[dict[str, Any]] = []
+        batch_count = 0
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for start in range(0, len(clean_kbs), CHUNK_QUERY_BATCH_SIZE):
+                batch_count += 1
+                kb_batch = clean_kbs[start : start + CHUNK_QUERY_BATCH_SIZE]
+                placeholders = ", ".join("?" for _ in kb_batch)
+                cursor.execute(
+                    f"""
+                    SELECT c.id, c.kb_name, c.doc_id, c.chunk_index, c.content,
+                           c.prev_chunk_id, c.next_chunk_id, c.images_json, c.created_at,
+                           d.title AS doc_title, d.source_uri AS doc_source_uri,
+                           -bm25(chunks_fts) AS fts_score
+                    FROM chunks_fts
+                    JOIN chunks c ON c.id = chunks_fts.chunk_id
+                    LEFT JOIN documents d ON c.doc_id = d.id AND c.kb_name = d.kb_name
+                    WHERE chunks_fts MATCH ?
+                      AND chunks_fts.kb_name IN ({placeholders})
+                    ORDER BY bm25(chunks_fts) ASC, c.id ASC
+                    LIMIT ?
+                    """,
+                    (fts_query, *kb_batch, top_k),
+                )
+                hits.extend(normalize_fts_hit_row(dict(row)) for row in cursor.fetchall())
+
+        return merge_fts_batch_hits(hits, batch_count=batch_count, top_k=top_k)
 
     def register_image_assets(
         self,

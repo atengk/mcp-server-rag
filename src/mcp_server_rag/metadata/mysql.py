@@ -9,10 +9,15 @@ MySQL 元数据目录适配器实现。
 """
 
 import importlib
+import logging
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from mcp_server_rag.fts import build_mysql_ft_query
+from mcp_server_rag.metadata.base import normalize_kb_names
 from mcp_server_rag.metadata.relational import _RelationalMetadataCatalog
+
+logger = logging.getLogger(__name__)
 
 
 def _load_pymysql() -> Any:
@@ -44,6 +49,21 @@ def _is_duplicate_key_error(exc: Exception) -> bool:
         return True
     msg = str(exc)
     return "Duplicate entry" in msg or "UNIQUE constraint failed" in msg
+
+
+def _is_duplicate_index_error(exc: Exception) -> bool:
+    """精准判断驱动异常是否为重复创建全文索引（MySQL 1061 / Duplicate key name）。"""
+    if exc.args and exc.args[0] == 1061:
+        return True
+    return "Duplicate key name" in str(exc)
+
+
+def _is_ngram_unsupported_error(exc: Exception) -> bool:
+    """判断 MySQL 实例是否因未加载 ngram 分词插件而无法解析 ``WITH PARSER ngram``。"""
+    if exc.args and exc.args[0] == 1128:
+        return True
+    lowered = str(exc).lower()
+    return "ngram" in lowered or "parser" in lowered
 
 
 class MySQLMetadataCatalog(_RelationalMetadataCatalog):
@@ -209,4 +229,59 @@ class MySQLMetadataCatalog(_RelationalMetadataCatalog):
                 byte_size = %s
             """,
             (*params, kb_name, doc_id, filename, storage_uri, mime_type, byte_size),
+        )
+
+    def _post_init_schema(self, cursor: Any) -> None:
+        """幂等创建 MySQL FULLTEXT 全文索引，优先启用 ngram 中文分词插件并在缺失时降级。"""
+        cursor.execute("SHOW INDEX FROM chunks WHERE Key_name = 'idx_chunks_content_ft'")
+        if cursor.fetchone() is not None:
+            return
+
+        try:
+            cursor.execute(
+                "ALTER TABLE chunks ADD FULLTEXT INDEX "
+                "idx_chunks_content_ft (content) WITH PARSER ngram"
+            )
+        except Exception as exc:
+            if _is_duplicate_index_error(exc):
+                logger.debug("MySQL 全文索引 idx_chunks_content_ft 已存在，跳过创建")
+                return
+            if _is_ngram_unsupported_error(exc):
+                logger.warning(
+                    "MySQL 当前实例不支持 ngram 全文分词插件，降级创建标准 FULLTEXT 索引: %s",
+                    exc,
+                )
+                try:
+                    cursor.execute(
+                        "ALTER TABLE chunks ADD FULLTEXT INDEX idx_chunks_content_ft (content)"
+                    )
+                except Exception as fb_exc:
+                    if not _is_duplicate_index_error(fb_exc):
+                        raise
+            else:
+                raise
+
+    def search_chunks_fts(
+        self,
+        kb_names: list[str],
+        query: str,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """基于 MySQL FULLTEXT 倒排索引执行全文检索并按相关度降序返回。"""
+        clean_kbs = normalize_kb_names(kb_names)
+        if not clean_kbs or top_k <= 0:
+            return []
+
+        ft_query = build_mysql_ft_query(query)
+        if not ft_query:
+            return []
+
+        return self._execute_fts_query(
+            clean_kbs=clean_kbs,
+            score_expr="MATCH(c.content) AGAINST (%s IN NATURAL LANGUAGE MODE)",
+            score_params=(ft_query,),
+            match_clause="MATCH(c.content) AGAINST (%s IN NATURAL LANGUAGE MODE)",
+            where_params=(ft_query,),
+            order_clause="fts_score DESC, c.id ASC",
+            top_k=top_k,
         )

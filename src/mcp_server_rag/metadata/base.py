@@ -43,11 +43,61 @@ def deduplicate_chunk_ids(chunk_ids: list[str]) -> list[str]:
     return list(dict.fromkeys(cid for cid in chunk_ids if cid))
 
 
+def normalize_kb_names(kb_names: list[str]) -> list[str]:
+    """清理并去重目标知识库名称列表，保持原始输入顺序。"""
+    return list(dict.fromkeys(name.strip() for name in kb_names if name and name.strip()))
+
+
 def normalize_chunk_row(data: dict[str, Any]) -> dict[str, Any]:
     """将关系型或 SQLite chunks 行转换为含结构化 images 列表的标准切片字典。"""
     data["chunk_index"] = int(data.get("chunk_index") or 0)
     data["images"] = decode_images_json(data.pop("images_json", "[]"))
     return data
+
+
+def normalize_fts_hit_row(data: dict[str, Any]) -> dict[str, Any]:
+    """将 FTS 查询返回的关系行标准化为与混合检索兼容的候选切片字典。"""
+    chunk_index = int(data.get("chunk_index") or 0)
+    kb_name = str(data.get("kb_name") or "")
+    doc_id = str(data.get("doc_id") or "")
+    images = decode_images_json(data.get("images_json", "[]"))
+    raw_score = data.get("fts_score")
+    fts_score = float(raw_score) if raw_score is not None else 0.0
+    title = str(data.get("doc_title") or "")
+    source_uri = str(data.get("doc_source_uri") or "")
+
+    return {
+        "chunk_id": str(data.get("id") or ""),
+        "kb_name": kb_name,
+        "doc_id": doc_id,
+        "chunk_index": chunk_index,
+        "text": str(data.get("content") or ""),
+        "fts_score": max(0.0, fts_score),
+        "images": images,
+        "metadata": {
+            "kb_name": kb_name,
+            "doc_id": doc_id,
+            "chunk_index": chunk_index,
+            "title": title,
+            "source_uri": source_uri,
+        },
+    }
+
+
+def merge_fts_batch_hits(
+    hits: list[dict[str, Any]],
+    batch_count: int,
+    top_k: int,
+) -> list[dict[str, Any]]:
+    """在跨多批次 KB 查询后执行全局 FTS 评分重排与 Top-K 截断。"""
+    if batch_count > 1:
+        hits.sort(
+            key=lambda item: (
+                -float(item.get("fts_score") or 0.0),
+                str(item.get("chunk_id") or ""),
+            )
+        )
+    return hits[:top_k]
 
 
 @runtime_checkable
@@ -265,6 +315,26 @@ class MetadataCatalogAdapter(Protocol):
 
         Returns:
             按 ``chunk_index`` 升序排列的切片详情列表；无记录时返回空列表 ``[]``。
+        """
+        ...
+
+    def search_chunks_fts(
+        self,
+        kb_names: list[str],
+        query: str,
+        top_k: int = 20,
+    ) -> list[dict[str, Any]]:
+        """在指定知识库作用域内执行数据库原生全文倒排检索（BM25/ts_rank/FULLTEXT）。
+
+        Args:
+            kb_names: 限定检索的知识库名称列表。
+            query: 用户检索查询文本。
+            top_k: 返回候选切片的最大数量，默认 ``20``。
+
+        Returns:
+            按相关性降序排列的标准切片命中列表，每项包含 ``chunk_id``、``kb_name``、
+            ``doc_id``、``chunk_index``、``text``、``fts_score``、``images`` 与
+            ``metadata``；无匹配或查询无效时返回空列表 ``[]``。
         """
         ...
 
