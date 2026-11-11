@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 from mcp.server import MCPServer
 
-from mcp_server_rag.config import get_settings
+from mcp_server_rag.config import Settings, get_settings
 from mcp_server_rag.embedding import get_embedding_provider
 from mcp_server_rag.metadata import MetadataCatalog
 from mcp_server_rag.parsers import (
@@ -30,10 +30,8 @@ from mcp_server_rag.vector_store.chroma import ChromaVectorStoreAdapter
 # 兼容 FastMCP 类型别名
 FastMCP = MCPServer
 
-# 初始化 MCP 服务实例
-mcp = FastMCP(
-    name="mcp-server-rag",
-    instructions="Model Context Protocol Server for Retrieval-Augmented Generation (RAG).",
+READ_ONLY_BLOCK_MSG: str = (
+    "只读模式已启用，拒绝执行写操作 (Write operations disabled in read-only mode)"
 )
 
 
@@ -54,7 +52,6 @@ def _validate_kb_name(name: str) -> tuple[bool, str]:
     return True, ""
 
 
-@mcp.tool()
 def health_check() -> dict[str, str]:
     """检查 RAG MCP 服务基础运行状态。
 
@@ -68,7 +65,6 @@ def health_check() -> dict[str, str]:
     }
 
 
-@mcp.tool()
 def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
     """创建新的知识库命名空间与底层向量存储集合。
 
@@ -79,11 +75,18 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
     Returns:
         dict[str, Any]: 创建结果状态与说明
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "name": name,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     valid, err_msg = _validate_kb_name(name)
     if not valid:
         return {"success": False, "name": name, "message": err_msg}
 
-    settings = get_settings()
     catalog, vector_store = _get_services()
 
     # 检查是否已存在
@@ -118,7 +121,6 @@ def rag_create_kb(name: str, description: str = "") -> dict[str, Any]:
     }
 
 
-@mcp.tool()
 def rag_list_kbs() -> list[dict[str, Any]]:
     """枚举所有已创建的知识库清单及其文档数、切片统计与更新时间。
 
@@ -129,7 +131,6 @@ def rag_list_kbs() -> list[dict[str, Any]]:
     return catalog.list_kbs()
 
 
-@mcp.tool()
 def rag_clear_kb(name: str) -> dict[str, Any]:
     """清空指定知识库中的所有文档与切片数据，但保留知识库本身的基础配置与元数据。
 
@@ -139,6 +140,14 @@ def rag_clear_kb(name: str) -> dict[str, Any]:
     Returns:
         dict[str, Any]: 清空结果与状态说明
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "name": name,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     catalog, vector_store = _get_services()
 
     # 检查知识库是否存在
@@ -162,7 +171,6 @@ def rag_clear_kb(name: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
 def rag_delete_kb(name: str) -> dict[str, Any]:
     """物理销毁指定知识库及其关联的所有文档元数据与向量索引集合。
 
@@ -172,6 +180,14 @@ def rag_delete_kb(name: str) -> dict[str, Any]:
     Returns:
         dict[str, Any]: 删除结果与状态说明
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "name": name,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     catalog, vector_store = _get_services()
 
     # 检查知识库是否存在
@@ -195,7 +211,6 @@ def rag_delete_kb(name: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
 def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
     """从指定知识库中物理删除特定文档及其所有切片与向量索引。
 
@@ -208,6 +223,15 @@ def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
     Returns:
         dict[str, Any]: 删除操作结果状态字典
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "kb_name": kb_name,
+            "doc_id": doc_id,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     clean_doc = doc_id.strip() if doc_id else ""
     if not clean_doc:
         return {
@@ -259,7 +283,6 @@ def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
     }
 
 
-@mcp.tool()
 def rag_doctor() -> dict[str, Any]:
     """全维自检诊断探针，检查存储引擎连通性、本地模型配置、磁盘占用与系统环境。
 
@@ -304,7 +327,6 @@ def rag_doctor() -> dict[str, Any]:
     }
 
 
-@mcp.tool()
 def rag_index_text(
     kb_name: str,
     text: str,
@@ -326,12 +348,18 @@ def rag_index_text(
     Returns:
         dict[str, Any]: 索引执行结果状态字典
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     if not text or not text.strip():
         return {"success": False, "message": "正文内容不能为空"}
     if not title or not title.strip():
         return {"success": False, "message": "文档标题 (title) 不能为空"}
 
-    settings = get_settings()
     catalog, vector_store = _get_services()
 
     # 1. 校验知识库是否存在
@@ -422,7 +450,6 @@ def rag_index_text(
     }
 
 
-@mcp.tool()
 def rag_index_file(
     kb_name: str,
     file_path: str,
@@ -440,6 +467,13 @@ def rag_index_file(
     Returns:
         dict[str, Any]: 索引结果状态字典
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     path = Path(file_path).resolve()
     if not path.exists():
         return {"success": False, "message": f"文件不存在: {file_path}"}
@@ -600,7 +634,6 @@ IGNORED_FILE_EXTENSIONS: set[str] = {
 }
 
 
-@mcp.tool()
 def rag_index_directory(
     kb_name: str,
     dir_path: str,
@@ -620,6 +653,13 @@ def rag_index_directory(
     Returns:
         dict[str, Any]: 目录批量摄取统计报告字典
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     path = Path(dir_path).resolve()
     if not path.exists() or not path.is_dir():
         return {
@@ -719,7 +759,6 @@ def rag_index_directory(
     }
 
 
-@mcp.tool()
 def rag_index_url(
     kb_name: str,
     url: str,
@@ -737,6 +776,13 @@ def rag_index_url(
     Returns:
         dict[str, Any]: 索引结果状态字典
     """
+    settings = get_settings()
+    if settings.read_only:
+        return {
+            "success": False,
+            "message": READ_ONLY_BLOCK_MSG,
+        }
+
     clean_url = url.strip()
     if not (clean_url.startswith("http://") or clean_url.startswith("https://")):
         return {
@@ -945,7 +991,6 @@ def _resolve_target_kbs(
     return [], False
 
 
-@mcp.tool()
 def rag_search(
     kb_name: str | list[str],
     query: str,
@@ -1028,7 +1073,6 @@ def rag_search(
     return all_filtered[:top_k]
 
 
-@mcp.tool()
 def rag_query_with_context(
     kb_name: str | list[str],
     query: str,
@@ -1086,9 +1130,56 @@ def rag_query_with_context(
     return "\n".join(context_sections).strip()
 
 
+def create_server(settings: Settings | None = None) -> FastMCP:
+    """构建并配置 FastMCP 服务端实例。
+
+    根据运行时 Settings 配置（如 MCP_RAG_READ_ONLY）决定是否暴露写操作类工具：
+    - 当 read_only=True 时，仅暴露只读查询与自检工具
+      (rag_search, rag_query_with_context, rag_list_kbs, rag_doctor, health_check)；
+    - 当 read_only=False 时，注册包含写操作、索引、建库与删除类在内的全部 13 项工具。
+
+    Args:
+        settings: 可选的自定义运行时配置，缺省时自动读取当前全局配置
+
+    Returns:
+        FastMCP: 配置并注册完成的 FastMCP 服务端实例
+    """
+    cfg = settings or get_settings()
+    server = FastMCP(
+        name="mcp-server-rag",
+        instructions="Model Context Protocol Server for Retrieval-Augmented Generation (RAG).",
+    )
+
+    # 1. 注册核心只读工具
+    server.add_tool(health_check)
+    server.add_tool(rag_list_kbs)
+    server.add_tool(rag_doctor)
+    server.add_tool(rag_search)
+    server.add_tool(rag_query_with_context)
+
+    # 2. 若处于读写模式，注册写操作与索引工具；只读模式下物理隐藏
+    if not cfg.read_only:
+        server.add_tool(rag_create_kb)
+        server.add_tool(rag_clear_kb)
+        server.add_tool(rag_delete_kb)
+        server.add_tool(rag_delete_document)
+        server.add_tool(rag_index_text)
+        server.add_tool(rag_index_file)
+        server.add_tool(rag_index_directory)
+        server.add_tool(rag_index_url)
+
+    return server
+
+
+# 默认全局 MCP 服务实例
+mcp: FastMCP = create_server()
+
+
 def main() -> None:
     """运行 MCP 服务主入口。"""
-    mcp.run()
+    settings = get_settings()
+    server = create_server(settings)
+    server.run()
 
 
 if __name__ == "__main__":
