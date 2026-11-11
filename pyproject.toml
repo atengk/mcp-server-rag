@@ -1,0 +1,80 @@
+[project]
+name = "atengk-mcp-server-rag"
+version = "0.1.0"
+description = "基于 Python 与 FastMCP 构建的高性能检索增强生成 (RAG) 模型上下文协议 (MCP) 服务，为大语言模型提供知识库检索与上下文增强能力。"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ateng", email = "2385569970@qq.com" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "rag",
+    "retrieval-augmented-generation",
+    "vector-search",
+    "knowledge-base",
+    "llm",
+    "fastmcp",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "mcp>=1.3.0",
+    "pydantic>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/atengk/mcp-server-rag"
+Documentation = "https://github.com/atengk/mcp-server-rag#readme"
+Repository = "https://github.com/atengk/mcp-server-rag"
+Issues = "https://github.com/atengk/mcp-server-rag/issues"
+Changelog = "https://github.com/atengk/mcp-server-rag/releases"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.3.0",
+    "mypy>=1.9.0",
+]
+
+[project.scripts]
+atengk-mcp-server-rag = "mcp_server_rag:main"
+mcp-server-rag = "mcp_server_rag:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mcp_server_rag"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+python_files = ["test_*.py", "*_test.py"]

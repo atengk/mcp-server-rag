@@ -1,0 +1,358 @@
+# ==============================================================================
+# 工作流模版：Python 统合发版编排流水线 (Python Unified Release)
+# 适用场景：Python 开源库、CLI 工具、FastAPI/Flask 应用与 MCP Server 的一站式全自动发版
+# 架构规范：Build Once, Distribute Everywhere (单次测试与构建，多路并行安全分发)
+# 触发通道：
+#   - 标签推送 (push tags: v*)：本地执行 git tag v1.0.0 && git push origin v1.0.0
+#   - 网页手动触发 (workflow_dispatch)：在 Actions 界面输入版本号 (如 v1.0.0)，自动校验后发版
+# 核心特性：
+#   - 统合发版前置测试门禁 (gate-test)：测试失败全盘熔断，严禁流转发布坏制品
+#   - 单次编译构建不可变产物：统一构建 sdist 与 wheel，计算 SHA-256 Checksums 并跨任务复用
+#   - GitHub Release 发版：基于 git-cliff 自动提取更新日志并挂载制品附件
+#   - PyPI 官方包免密发布：全面支持现代 OIDC (Trusted Publishing)，杜绝静态密钥泄露风险
+#   - Docker 多架构容器镜像：构建 linux/amd64 与 arm64 镜像推至 GHCR，严格防污染 latest 标签
+#   - 开发者体验看板：执行完毕直出富文本 $GITHUB_STEP_SUMMARY 结构化制品与拉取指令清单
+# ==============================================================================
+
+name: Python Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号 (必须以 v 开头，符合 SemVer 规范，如 v1.0.0 或 v1.0.0-rc.1)'
+        required: true
+        type: string
+
+# 并发控制：发版流水线单例排队执行，严禁取消执行中的发版以保障版本与制品原子性
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: 生产级发版前置质量门禁 (Gate Test)
+  # ----------------------------------------------------------------------------
+  gate-test:
+    name: 发版前置质量门禁
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装项目依赖与检查工具
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install .; fi
+
+      - name: 代码规范与静态分析检查
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: 执行回归单元测试
+        run: |
+          if find tests -name "test_*.py" -o -name "*_test.py" 2>/dev/null | grep -q .; then
+            pytest
+          else
+            echo "暂未发现测试用例文件，跳过测试执行。"
+          fi
+          echo "✅ 发版前置质量门禁全部通过！"
+
+  # ----------------------------------------------------------------------------
+  # Job 2: 编译发行制品并计算不可变校验和 (Build Once)
+  # ----------------------------------------------------------------------------
+  build-artifacts:
+    name: 编译打包发行制品与生成哈希
+    runs-on: ubuntu-latest
+    needs: [gate-test]
+    timeout-minutes: 10
+    outputs:
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      raw_version: ${{ steps.meta.outputs.raw_version }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      has_dockerfile: ${{ steps.probe.outputs.has_dockerfile }}
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 探测项目 Dockerfile 存在性
+        id: probe
+        run: |
+          if [ -f Dockerfile ] || [ -f Containerfile ] || [ -f docker/Dockerfile ]; then
+            echo "has_dockerfile=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_dockerfile=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 解析与校验发版版本号
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # 严格防呆自检：阻断在非主干分支误触发发版
+            CURRENT_REF="${{ github.ref_name }}"
+            DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+            if [ -n "$DEFAULT_BRANCH" ] && [ "$CURRENT_REF" != "$DEFAULT_BRANCH" ]; then
+              echo "::error::禁止在非默认主干分支 [$CURRENT_REF] 触发发版！默认主干为 [$DEFAULT_BRANCH]，请切换至主干分支后重试。"
+              exit 1
+            elif [ -z "$DEFAULT_BRANCH" ] && [ "$CURRENT_REF" != "main" ] && [ "$CURRENT_REF" != "master" ]; then
+              echo "::error::禁止在非主干分支 [$CURRENT_REF] 触发发版！仅允许在 main 或 master 分支发版。"
+              exit 1
+            fi
+
+            TAG_NAME="${{ inputs.version }}"
+            if [[ "$TAG_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then TAG_NAME="v$TAG_NAME"; fi
+            if ! echo "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+              echo "::error::版本号 [$TAG_NAME] 不符合语义化版本规范！必须形如 v1.0.0 或 v1.0.0-rc.1"
+              exit 1
+            fi
+            if git ls-remote --tags origin "refs/tags/$TAG_NAME" | grep -q "$TAG_NAME"; then
+              echo "::error::远程仓库已存在相同标签 [$TAG_NAME]，禁止重复发版！"
+              exit 1
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git tag -a "$TAG_NAME" -m "Release $TAG_NAME"
+            git push origin "$TAG_NAME"
+          else
+            TAG_NAME="${{ github.ref_name }}"
+            # 语义化版本正则双重防呆：阻断非标原生标签误触发发版
+            if ! echo "$TAG_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+              echo "::error::推送的标签 [$TAG_NAME] 不符合语义化版本规范！必须形如 v1.0.0 或 v1.0.0-rc.1，已安全终止发版流水线。"
+              exit 1
+            fi
+
+            # 标签直系祖先谱系校验 (Tag Lineage Guard)：确保 Tag 源自默认主干
+            DEFAULT_BRANCH="${{ github.event.repository.default_branch }}"
+            DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+            git fetch origin "$DEFAULT_BRANCH"
+            TAG_COMMIT=$(git rev-parse HEAD)
+            if ! git merge-base --is-ancestor "$TAG_COMMIT" "origin/$DEFAULT_BRANCH"; then
+              echo "::error::安全熔断！标签 [$TAG_NAME] 指向的提交 [$TAG_COMMIT] 未合入默认主干分支 [$DEFAULT_BRANCH]！"
+              echo "::error::为防未经验证的代码随版本发布，严禁从任何未经合入的特性分支或孤立提交发版。"
+              exit 1
+            fi
+            echo "发版 Tag 谱系校验通过: 确认源自默认主干 [$DEFAULT_BRANCH]。"
+          fi
+
+          RAW_VERSION="${TAG_NAME#v}"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+          echo "raw_version=$RAW_VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG_NAME" =~ - ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: 安装标准构建工具
+        run: python -m pip install --upgrade pip build
+
+      - name: 编译标准发行包 (sdist & wheel) 并生成 SHA-256 校验清单
+        run: |
+          mkdir -p dist
+          python -m build --outdir dist/
+          cd dist
+          for file in *; do
+            if [ -f "$file" ] && [ "$file" != "checksums.txt" ]; then
+              sha256sum "$file"
+            fi
+          done > checksums.txt
+          if [ -s checksums.txt ]; then
+            echo "=== 构建产物校验和清单 ==="
+            cat checksums.txt
+          fi
+
+      - name: 归档不可变制品附件
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-dist
+          path: dist/*
+          retention-days: 1
+
+  # ----------------------------------------------------------------------------
+  # Job 3: 发布 GitHub Release 与挂载产物
+  # ----------------------------------------------------------------------------
+  publish-release:
+    name: 发布 GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build-artifacts]
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: 检出源码 (全量历史供日志生成)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 下载构建制品
+        uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: 生成发布日志 (git-cliff)
+        uses: orhun/git-cliff-action@v4
+        id: git-cliff
+        with:
+          config: ${{ hashFiles('.cliff.toml') != '' && '.cliff.toml' || '' }}
+          args: --tag ${{ needs.build-artifacts.outputs.tag_name }} --latest --strip header --github-repo ${{ github.repository }}
+        env:
+          OUTPUT: CHANGELOG_RELEASE.md
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 创建 GitHub Release 并挂载附件
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.build-artifacts.outputs.tag_name }}
+          name: ${{ needs.build-artifacts.outputs.tag_name }}
+          body: ${{ steps.git-cliff.outputs.content }}
+          draft: false
+          prerelease: ${{ needs.build-artifacts.outputs.is_prerelease == 'true' }}
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ----------------------------------------------------------------------------
+  # Job 4: 分发 Python 包至 PyPI 官方中心仓库 (OIDC 免密认证)
+  # ----------------------------------------------------------------------------
+  publish-pypi:
+    name: 发布至 PyPI 官方源
+    runs-on: ubuntu-latest
+    needs: [build-artifacts]
+    if: vars.ENABLE_PYPI_PUBLISH == 'true'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # PyPI Trusted Publishing (OIDC) 核心免密权限
+    steps:
+      - name: 下载构建制品
+        uses: actions/download-artifact@v8
+        with:
+          name: release-dist
+          path: dist
+
+      - name: 移除校验清单 (仅保留 wheel 与 tar.gz 上传 PyPI)
+        run: rm -f dist/checksums.txt
+
+      - name: 发布发行包至 PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: true
+
+  # ----------------------------------------------------------------------------
+  # Job 5: 构建多架构 Docker 容器镜像并推送至 GHCR
+  # ----------------------------------------------------------------------------
+  publish-docker:
+    name: 构建并推送 Docker 镜像 (GHCR)
+    runs-on: ubuntu-latest
+    needs: [build-artifacts]
+    if: needs.build-artifacts.outputs.has_dockerfile == 'true'
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: 转换仓库名称为全小写
+        run: echo "REPO_LC=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 设置 QEMU 模拟器 (多架构支持)
+        uses: docker/setup-qemu-action@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 提取 Docker 镜像元数据与标签
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: |
+            ghcr.io/${{ env.REPO_LC }}
+          flavor: |
+            latest=${{ needs.build-artifacts.outputs.is_prerelease != 'true' }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.build-artifacts.outputs.tag_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.build-artifacts.outputs.tag_name }}
+            type=sha,format=short
+
+      - name: 构建并推送多架构镜像 (amd64 / arm64)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ----------------------------------------------------------------------------
+  # Job 6: 结构化发版看板摘要报告直出
+  # ----------------------------------------------------------------------------
+  summary:
+    name: 输出发版看板报告
+    runs-on: ubuntu-latest
+    needs: [build-artifacts, publish-release, publish-pypi, publish-docker]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: 生成富文本发版报告
+        run: |
+          TAG="${{ needs.build-artifacts.outputs.tag_name }}"
+          REPO_LC="${GITHUB_REPOSITORY,,}"
+          {
+            echo "## 🚀 Python 统合发版全景看板"
+            echo ""
+            echo "| 发版维度 | 状态 | 详细信息 |"
+            echo "| :--- | :---: | :--- |"
+            echo "| **发版版本** | \`$TAG\` | ${{ needs.build-artifacts.outputs.is_prerelease == 'true' && '🧪 Pre-release' || '🎉 稳定正式版' }} |"
+            echo "| **GitHub Release** | ${{ needs.publish-release.result == 'success' && '✅ 成功' || '❌ 失败' }} | 更新日志已挂载不可变构建附件 |"
+            echo "| **PyPI 官方分发** | ${{ needs.publish-pypi.result == 'success' && '✅ 成功' || (needs.publish-pypi.result == 'skipped' && '⚡ 已跳过 (未启用)' || '❌ 失败') }} | OIDC 免密发布至 pypi.org |"
+            echo "| **GHCR 容器镜像** | ${{ needs.publish-docker.result == 'success' && '✅ 成功' || (needs.publish-docker.result == 'skipped' && '⚡ 已跳过 (无 Dockerfile)' || '❌ 失败') }} | 多架构 \`linux/amd64,arm64\` 镜像已推送 |"
+            echo ""
+            echo "### 📦 快速拉取与安装验证"
+            echo '```bash'
+            echo "pip install ${GITHUB_REPOSITORY#*/}==${TAG#v}"
+            echo "docker pull ghcr.io/${REPO_LC}:${TAG#v}"
+            if [ "${{ needs.build-artifacts.outputs.is_prerelease }}" != "true" ]; then
+              echo "docker pull ghcr.io/${REPO_LC}:latest"
+            fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

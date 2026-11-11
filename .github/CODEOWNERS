@@ -1,0 +1,12 @@
+# ==============================================================================
+# GitHub 代码属主与审阅者自动指派配置 (Code Owners)
+# 详见: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+# ==============================================================================
+
+# 全局默认所有者（通配所有未被下级路径覆盖的文件）
+* @atengk
+
+# 核心基础设施与自动化流水线重点守护
+/.github/ @atengk
+/scripts/ @atengk
+/.githooks/ @atengk

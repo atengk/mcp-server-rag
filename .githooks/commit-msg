@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Conventional Commits 本地提交通用规范校验钩子
+#
+# 在本地提交阶段自动校验提交说明首行格式，智能放行 Merge、Revert 与临时变基提交，
+# 格式不合规时进行拦截并输出友好诊断指引与交互向导建议。
+#
+# @author Ateng
+# @since 2026-10-09
+# ==============================================================================
+
+set -eo pipefail
+
+MSG_FILE="$1"
+
+if [ ! -f "$MSG_FILE" ]; then
+  exit 0
+fi
+
+# 提取第一行非注释内容并去除首尾空白
+FIRST_LINE=$(grep -v '^#' "$MSG_FILE" | head -n 1 | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+
+# 若内容为空，交由 Git 原生逻辑拦截
+if [ -z "$FIRST_LINE" ]; then
+  exit 0
+fi
+
+# 1. 自动放行机制 (Merge, Revert, 临时变基)
+if echo "$FIRST_LINE" | grep -Eq '^(Merge (branch|tag|remote-tracking branch|pull request)|Revert |(fixup|squash)!)'; then
+  exit 0
+fi
+
+# 2. Conventional Commits 正则校验
+# 格式: <type>(<scope>)<!>: <subject>
+CONVENTIONAL_REGEX="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-zA-Z0-9._-]+\))?!?: .+$"
+
+if ! echo "$FIRST_LINE" | grep -Eq "$CONVENTIONAL_REGEX"; then
+  # 终端色彩适配
+  if [ -t 1 ]; then
+    COLOR_RESET="\033[0m"
+    COLOR_BOLD="\033[1m"
+    COLOR_RED="\033[31m"
+    COLOR_YELLOW="\033[33m"
+    COLOR_CYAN="\033[36m"
+  else
+    COLOR_RESET=""
+    COLOR_BOLD=""
+    COLOR_RED=""
+    COLOR_YELLOW=""
+    COLOR_CYAN=""
+  fi
+
+  printf "\n%b[ERROR] 提交信息不符合 Conventional Commits 规范！%b\n" "${COLOR_RED}" "${COLOR_RESET}"
+  printf "当前提交信息: %b\"%s\"%b\n\n" "${COLOR_BOLD}" "$FIRST_LINE" "${COLOR_RESET}"
+  printf "%b规范格式:%b <type>(<scope>): <subject>\n" "${COLOR_YELLOW}" "${COLOR_RESET}"
+  printf "%b支持类型:%b feat | fix | docs | style | refactor | perf | test | build | ci | chore | revert\n" "${COLOR_YELLOW}" "${COLOR_RESET}"
+  printf "%b参考示例:%b\n" "${COLOR_YELLOW}" "${COLOR_RESET}"
+  printf "  feat: 支持用户登录授权\n"
+  printf "  fix(parser): 修复空字符串解析异常\n"
+  printf "  docs: 完善项目接入文档\n\n"
+  printf "💡 %b建议直接运行交互式向导快速提交:%b %bbash scripts/commit.sh%b\n\n" "${COLOR_CYAN}" "${COLOR_RESET}" "${COLOR_BOLD}" "${COLOR_RESET}"
+  exit 1
+fi
+
+exit 0

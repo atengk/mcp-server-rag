@@ -1,0 +1,62 @@
+# ==============================================================================
+# Dependabot 依赖自动化更新配置 (Dependabot Version Updates)
+#
+# 💡 机制说明：
+# 1. 本配置负责常规月度依赖升级（Version Updates），采用语义化双轨模型聚合 PR；
+# 2. 针对高危 CVE 漏洞的即时修复（Dependabot Security Updates）由 GitHub 平台原生实时守护，两者互补。
+# 详见: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuring-dependabot-version-updates
+# ==============================================================================
+
+version: 2
+updates:
+  # 持续监控 GitHub Actions 工作流版本更新
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "dependencies"
+    groups:
+      # 语义化双轨模型：将所有 Actions 的 Minor 与 Patch 补丁打包为单一 PR，杜绝通知轰炸；
+      # 遇到 Major 重大版本跳跃（如 v4 -> v7）自动单列独立 PR，便于审查破坏性更新与定位问题。
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- [Python / pip 生态] ---
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    labels:
+      - "dependencies"
+    groups:
+      dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # --- [Docker 容器镜像生态] ---
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "build"
+      include: "scope"
+    labels:
+      - "dependencies"

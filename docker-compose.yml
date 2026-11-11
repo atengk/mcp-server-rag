@@ -1,0 +1,13 @@
+services:
+  mcp-server-rag:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/atengk/mcp-server-rag:latest
+    container_name: mcp-server-rag
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      - LOG_LEVEL=INFO
+    stdin_open: true
+    tty: true

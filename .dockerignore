@@ -1,0 +1,79 @@
+# ==============================================================================
+# Docker 构建上下文忽略清单
+# 避免将本地缓存、构建中间产物及机密信息发送到 Docker 守护进程
+# ==============================================================================
+
+# 版本控制、CI 与本地工程脚本
+.git
+.github
+.githooks
+scripts
+.cliff.toml
+.gitignore
+.dockerignore
+
+# 操作系统、IDE 与临时目录
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+tmp
+temp
+.tmp
+.temp
+*.tmp
+*.temp
+scratch
+.scratch
+scratchpad
+.scratchpad
+sandbox
+.sandbox
+
+# 测试覆盖率与代码分析缓存
+coverage
+*.lcov
+.nyc_output
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.eslintcache
+
+# 敏感文件与本地环境变量
+.env
+.env.*
+!.env.example
+
+# 日志
+*.log
+logs
+
+# Node.js
+node_modules
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Java
+target/
+.gradle/
+build/
+bin/
+*.class
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Go / 可执行文件
+*.exe
+/bin
+
+# Rust
+**/*.rs.bk

@@ -1,0 +1,211 @@
+# ==============================================================================
+# 工作流模版：Python 持续集成流水线 (Python CI)
+# 适用场景：Python 模块、开源类库、FastAPI / Django / Flask Web 应用与 MCP Server 的 PR 门禁
+# 触发条件：
+#   - push: 主干分支 (main, master) 代码推送
+#   - pull_request: 针对主干分支的 PR 创建、编辑、代码同步
+# 核心特性：
+#   - 动态并发控制 (Dynamic Concurrency)：PR 提交自动中断陈旧运行，主干提交按序排队
+#   - 内部路径短路直通 (Path Fast-Pass)：纯文档改动秒级放行，彻底消除分支保护规则死锁
+#   - 分层兼容性矩阵 (Matrix Strategy)：PR 快速验证核心版本，主干全量扫描跨版本兼容性
+#   - 超高速现代静态分析工具 Ruff (代码规范 check 与格式化 format)
+#   - 终审门禁看板 (All Checks Passed)：统一盖戳并直出 GitHub Step Summary 结构化报表
+# ==============================================================================
+
+name: Python CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+    types: [opened, edited, synchronize, reopened]
+
+# 动态并发控制：PR 提交自动取消陈旧构建以节约算力；主干提交排队顺序执行保历史完整
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Job 1: PR 标题规范校验 (仅在 PR 触发时执行)
+  # ----------------------------------------------------------------------------
+  validate-pr-title:
+    name: 校验 PR 标题规范
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read
+    steps:
+      - name: 校验 PR 标题符合 Conventional Commits
+        uses: amannn/action-semantic-pull-request@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          types: |
+            feat
+            fix
+            docs
+            style
+            refactor
+            perf
+            test
+            build
+            ci
+            chore
+            revert
+
+  # ----------------------------------------------------------------------------
+  # Job 2: 动态探测变更路径 (实现内部短路直通网关)
+  # ----------------------------------------------------------------------------
+  detect-changes:
+    name: 探测变更路径
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code_changed: ${{ steps.filter.outputs.code }}
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 分析改动文件类型
+        uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            code:
+              - '!(*.md|docs/**|.gitignore|.editorconfig|LICENSE)'
+
+  # ----------------------------------------------------------------------------
+  # Job 3: 代码风格与规范静态分析 (Ruff)
+  # ----------------------------------------------------------------------------
+  lint:
+    name: 代码规范与格式化 (Ruff)
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.code_changed != 'false'
+    timeout-minutes: 10
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装 Ruff 静态检查工具
+        run: pip install ruff
+
+      - name: 代码风格与语法检查 (Ruff Linter & Formatter)
+        run: |
+          ruff check .
+          ruff format --check .
+
+  # ----------------------------------------------------------------------------
+  # Job 4: 跨版本兼容性单元测试矩阵 (pytest)
+  # ----------------------------------------------------------------------------
+  test:
+    name: 自动化测试 (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    if: needs.detect-changes.outputs.code_changed != 'false'
+    timeout-minutes: 15
+    strategy:
+      fail-fast: ${{ github.event_name == 'pull_request' }}
+      matrix:
+        # 分层矩阵策略：PR 仅测 3.12 极速反馈；主干推送执行多版本跨兼容性全量验证
+        python-version: ${{ github.event_name == 'pull_request' && fromJSON('["3.12"]') || fromJSON('["3.10", "3.11", "3.12"]') }}
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v7
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: 安装项目依赖与测试框架
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install .; fi
+
+      - name: 运行 pytest 单元测试
+        run: |
+          if find tests -name "test_*.py" -o -name "*_test.py" 2>/dev/null | grep -q .; then
+            pytest --cov
+          else
+            echo "暂未发现测试用例文件，跳过测试执行。"
+          fi
+
+  # ----------------------------------------------------------------------------
+  # Job 5: 质量门禁终审盖戳 (分支保护规则唯一指定强绑门禁)
+  # ----------------------------------------------------------------------------
+  all-checks-passed:
+    name: 质量门禁终审 (All Checks Passed)
+    runs-on: ubuntu-latest
+    needs: [detect-changes, validate-pr-title, lint, test]
+    if: always()
+    timeout-minutes: 5
+    steps:
+      - name: 汇总校验各任务执行结果
+        run: |
+          TITLE_RESULT="${{ needs.validate-pr-title.result }}"
+          DETECT_RESULT="${{ needs.detect-changes.result }}"
+          LINT_RESULT="${{ needs.lint.result }}"
+          TEST_RESULT="${{ needs.test.result }}"
+
+          echo "任务状态汇总: PR标题=[$TITLE_RESULT], 变更探测=[$DETECT_RESULT], 规范扫描=[$LINT_RESULT], 单测矩阵=[$TEST_RESULT]"
+
+          if [ "$TITLE_RESULT" = "failure" ] || [ "$TITLE_RESULT" = "cancelled" ]; then
+            echo "::error::PR 标题规范校验失败！请按照 Conventional Commits 规范修改 PR 标题。"
+            exit 1
+          fi
+
+          if [ "$DETECT_RESULT" = "failure" ] || [ "$DETECT_RESULT" = "cancelled" ]; then
+            echo "::error::变更路径探测任务异常中断！"
+            exit 1
+          fi
+
+          if [ "$LINT_RESULT" = "failure" ] || [ "$LINT_RESULT" = "cancelled" ]; then
+            echo "::error::Ruff 代码规范与格式化扫描失败！"
+            exit 1
+          fi
+
+          if [ "$TEST_RESULT" = "failure" ] || [ "$TEST_RESULT" = "cancelled" ]; then
+            echo "::error::pytest 兼容性单元测试失败！门禁熔断阻断。"
+            exit 1
+          fi
+
+          echo "✅ 全部必要质量门禁已全部通过！"
+
+      - name: 生成门禁看板摘要报告
+        if: always()
+        run: |
+          {
+            echo "## 🚦 Python CI 质量门禁终审报告"
+            echo ""
+            echo "| 检查项 | 判定状态 | 执行说明 |"
+            echo "| :--- | :---: | :--- |"
+            if [ "${{ github.event_name }}" = "pull_request" ]; then
+              echo "| **PR 标题规范校验** | ${{ needs.validate-pr-title.result == 'success' && '✅ 通过' || '❌ 失败' }} | Conventional Commits 语义化规范 |"
+            fi
+            echo "| **变更路径探测** | ${{ needs.detect-changes.result == 'success' && '✅ 通过' || '❌ 异常' }} | 区分文档短路与核心代码构建 |"
+            if [ "${{ needs.detect-changes.outputs.code_changed }}" = "false" ]; then
+              echo "| **代码规范与测试** | ⚡ 短路直通 | 仅涉及文档改动，自动跳过耗时测试并放行 |"
+            else
+              echo "| **Ruff 代码规范扫描** | ${{ needs.lint.result == 'success' && '✅ 通过' || '❌ 失败' }} | 静态语法风格与自动格式化校验 |"
+              echo "| **pytest 兼容性测试** | ${{ needs.test.result == 'success' && '✅ 通过' || '❌ 失败' }} | 分层多版本兼容性矩阵验证 |"
+            fi
+            echo ""
+            echo "> 💡 **分支保护规则建议**：请在 GitHub 仓库设置中将 \`质量门禁终审 (All Checks Passed)\` 设为唯一 Required Status Check。"
+          } >> "$GITHUB_STEP_SUMMARY"

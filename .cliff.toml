@@ -1,0 +1,55 @@
+# ==============================================================================
+# git-cliff 自动化变更日志配置
+# 详见: https://git-cliff.org/docs/configuration
+# ==============================================================================
+
+[remote.github]
+owner = "atengk"
+repo = "mcp-server-rag"
+
+[changelog]
+header = ""
+body = """
+{% for entry in commits | commit_groups(groups=commit_parsers_groups) %}
+### {{ entry.group | trim }}
+{% for commit in entry.commits %}
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}{{ commit.message | upper_first }}\
+  {% if commit.remote.pr_number %} in #{{ commit.remote.pr_number }}{% endif %}\
+  {% if commit.remote.username %} by @{{ commit.remote.username }}{% endif %}\
+  {% if not commit.remote.pr_number %} ({{ commit.id | truncate(length=7, end="") }}){% endif %}\
+{% endfor %}
+{% endfor %}
+{% if github.contributors | filter(attribute="is_first_time", value=true) | length != 0 %}
+### 🎉 新贡献者致谢 (New Contributors)
+{% for contributor in github.contributors | filter(attribute="is_first_time", value=true) %}
+- 感谢 @{{ contributor.username }} 提交的首次贡献！
+{% endfor %}
+{% endif %}\n
+"""
+trim = true
+
+[git]
+# 开启 Conventional Commits 解析
+conventional_commits = true
+# 即使未按规范前缀书写的普通提交也完整保留，杜绝漏掉任何变更
+filter_unconventional = false
+split_commits = false
+
+commit_parsers = [
+  # 过滤发版自增、开发快照推进与 PR/分支合并等无实质代码变更的视觉噪点
+  { message = "^chore\\(release\\):", skip = true },
+  { message = "^chore\\(build\\):.*next development iteration", skip = true },
+  { message = "^Merge pull request|^Merge branch", skip = true },
+  { message = "^.*!:|BREAKING CHANGE", group = "💥 破坏性更新 (Breaking Changes)" },
+  { message = "^feat", group = "🚀 新特性 (Features)" },
+  { message = "^fix", group = "🐛 缺陷修复 (Bug Fixes)" },
+  { message = "^perf", group = "⚡ 性能优化 (Performance)" },
+  { message = "^refactor", group = "🚜 代码重构 (Refactor)" },
+  { message = "^docs", group = "📝 文档变动 (Documentation)" },
+  { message = "^style", group = "🎨 代码格式 (Style)" },
+  { message = "^test", group = "🧪 测试相关 (Tests)" },
+  { message = "^build", group = "📦 构建系统 (Build System)" },
+  { message = "^ci", group = "⚙️ 流水线与工具 (CI/CD)" },
+  { message = "^chore", group = "🧹 常规维护 (Chores)" },
+  { message = "^revert", group = "⏪ 代码回滚 (Reverts)" },
+]

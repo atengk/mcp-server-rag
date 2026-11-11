@@ -1,0 +1,16 @@
+# ==============================================================================
+# GitHub Issues 治理配置
+# 详见: https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository
+# ==============================================================================
+
+# 关闭无模板空白 Issue 入口，防止无效提交
+blank_issues_enabled: false
+
+# 导流外链：引导用户提问或查阅文档
+contact_links:
+  - name: 💬 社区技术答疑与使用交流 (GitHub Discussions)
+    url: https://github.com/atengk/mcp-server-rag/discussions
+    about: 请在此讨论配置用法、提问咨询或分享实践，避免占用 Issue 跟踪。
+  - name: 📖 项目官方主页与文档 (Documentation)
+    url: https://github.com/atengk/mcp-server-rag#readme
+    about: 查阅快速开始指南、MCP 客户端接入配置及功能说明。
