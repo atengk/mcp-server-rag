@@ -35,7 +35,8 @@ class OpenAICompatibleEmbeddingProvider:
         base_url: str = "",
         api_key: str = "",
         dimension: int | None = None,
-        timeout: float = 60.0,
+        timeout: float = 30.0,
+        batch_size: int = 32,
     ) -> None:
         """初始化 OpenAI 兼容协议嵌入提供方并完成维度确定。
 
@@ -47,21 +48,27 @@ class OpenAICompatibleEmbeddingProvider:
             base_url: 自定义服务端点基地址；为空时按 `provider_type` 自动映射默认端点
             api_key: Bearer 鉴权密钥（Ollama 等本地免密服务可为空）
             dimension: 可选的显式 MRL 降维维度（正整数）；为空时自动探测
-            timeout: 单次 HTTP 请求与读取超时秒数，默认 60.0 秒
+            timeout: 单次 HTTP 请求与读取超时秒数，默认 30.0 秒
+            batch_size: 单次 `/v1/embeddings` 请求最大切片数量，默认 32
 
         Raises:
-            ValueError: 模型名称为空或显式 `dimension` 非正整数时抛出
+            ValueError: 模型名称为空、显式 `dimension` / `batch_size` / `timeout` 非正值时抛出
             RuntimeError: 自动维度探测请求失败或返回空向量时抛出
         """
         if not model_name or not model_name.strip():
             raise ValueError("Embedding 模型名称 (MCP_RAG_EMBEDDING_MODEL) 不能为空")
         if dimension is not None and dimension < 1:
             raise ValueError("显式 Embedding 维度 (MCP_RAG_EMBEDDING_DIMENSION) 必须为正整数")
+        if timeout <= 0:
+            raise ValueError("Embedding 超时秒数 (MCP_RAG_EMBEDDING_TIMEOUT_SECONDS) 必须大于 0")
+        if batch_size < 1:
+            raise ValueError("Embedding 批量分片大小 (MCP_RAG_EMBEDDING_BATCH_SIZE) 必须为正整数")
 
         self.provider_type = provider_type.strip().lower()
         self.model_name = model_name.strip()
         self.api_key = api_key.strip()
         self.timeout = timeout
+        self.batch_size = batch_size
         self._explicit_dimension = dimension
 
         resolved_base = (
@@ -96,22 +103,8 @@ class OpenAICompatibleEmbeddingProvider:
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
-    def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        """批量计算多段文本的高维稠密向量。
-
-        Args:
-            texts: 待向量化的文本列表；为空列表时直接返回 `[]` 而不发起网络请求
-
-        Returns:
-            list[list[float]]: 与输入顺序严格一致的稠密向量列表
-
-        Raises:
-            ValueError: 远端返回向量的实际维度与显式配置 `dimension` 不一致时抛出
-            RuntimeError: 网络超时、HTTP 非 2xx 状态码或响应 JSON 格式异常时抛出
-        """
-        if not texts:
-            return []
-
+    def _embed_single_batch(self, texts: list[str]) -> list[list[float]]:
+        """向 `/v1/embeddings` 发送单批切片请求并返回与输入顺序一致的稠密向量。"""
         payload: dict[str, Any] = {
             "model": self.model_name,
             "input": texts,
@@ -161,6 +154,31 @@ class OpenAICompatibleEmbeddingProvider:
             vectors.append(vec)
 
         return vectors
+
+    def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """按 ``batch_size`` 分批计算多段文本的高维稠密向量。
+
+        Args:
+            texts: 待向量化的文本列表；为空列表时直接返回 `[]` 而不发起网络请求
+
+        Returns:
+            list[list[float]]: 与输入顺序严格一致的稠密向量列表
+
+        Raises:
+            ValueError: 远端返回向量的实际维度与显式配置 `dimension` 不一致时抛出
+            RuntimeError: 网络超时、HTTP 非 2xx 状态码或响应 JSON 格式异常时抛出
+        """
+        if not texts:
+            return []
+
+        if len(texts) <= self.batch_size:
+            return self._embed_single_batch(texts)
+
+        all_vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            all_vectors.extend(self._embed_single_batch(batch))
+        return all_vectors
 
     def embed_query(self, query: str) -> list[float]:
         """计算单条查询语句的高维稠密向量。

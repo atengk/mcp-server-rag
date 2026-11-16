@@ -137,6 +137,15 @@ def _parse_bool_env(key: str, default: bool = False) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _parse_csv_env(key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """解析逗号分隔的字符串列表环境变量；显式设为空串时返回空元组以允许清空默认规则。"""
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    items = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    return tuple(items)
+
+
 def _parse_path_env(key: str, default: Path) -> Path:
     """安全解析文件路径环境变量并自动解析为绝对路径。"""
     raw = os.getenv(key)
@@ -173,6 +182,12 @@ class Settings(BaseModel):
     )
     embedding_dimension: int | None = Field(
         default_factory=lambda: _parse_optional_int_env("MCP_RAG_EMBEDDING_DIMENSION", min_val=1)
+    )
+    embedding_timeout_seconds: int = Field(
+        default_factory=lambda: _parse_int_env("MCP_RAG_EMBEDDING_TIMEOUT_SECONDS", 30, min_val=1)
+    )
+    embedding_batch_size: int = Field(
+        default_factory=lambda: _parse_int_env("MCP_RAG_EMBEDDING_BATCH_SIZE", 32, min_val=1)
     )
     read_only: bool = Field(default_factory=lambda: _parse_bool_env("MCP_RAG_READ_ONLY", False))
     chunk_size: int = Field(
@@ -231,13 +246,26 @@ class Settings(BaseModel):
         default_factory=lambda: _parse_bool_env("MCP_RAG_ARCHIVE_REMOTE_IMAGES", False)
     )
     remote_image_timeout_seconds: int = Field(
-        default_factory=lambda: _parse_int_env(
-            "MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS", 15, min_val=1
-        )
+        default_factory=lambda: _parse_int_env("MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS", 8, min_val=1)
     )
     remote_image_max_bytes: int = Field(
         default_factory=lambda: _parse_int_env(
             "MCP_RAG_REMOTE_IMAGE_MAX_BYTES", 10 * 1024 * 1024, min_val=1024
+        )
+    )
+    remote_image_concurrency: int = Field(
+        default_factory=lambda: _parse_int_env("MCP_RAG_REMOTE_IMAGE_CONCURRENCY", 4, min_val=1)
+    )
+    remote_image_skip_domains: tuple[str, ...] = Field(
+        default_factory=lambda: _parse_csv_env(
+            "MCP_RAG_REMOTE_IMAGE_SKIP_DOMAINS",
+            ("img.shields.io", "badgen.net", "forthebadge.com"),
+        )
+    )
+    remote_image_skip_extensions: tuple[str, ...] = Field(
+        default_factory=lambda: _parse_csv_env(
+            "MCP_RAG_REMOTE_IMAGE_SKIP_EXTENSIONS",
+            (".svg",),
         )
     )
     rerank_enabled: bool = Field(

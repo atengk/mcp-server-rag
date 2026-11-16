@@ -9,6 +9,7 @@ FastMCP 服务主实现模块。
 
 import hashlib
 import logging
+import math
 import re
 import shutil
 from collections.abc import Callable
@@ -19,6 +20,7 @@ from typing import Any
 import anyio
 import httpx
 from mcp.server import MCPServer
+from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError
 from mcp.server.mcpserver.resources.templates import ResourceTemplate
 from mcp.server.mcpserver.resources.types import FunctionResource
@@ -54,6 +56,7 @@ from mcp_server_rag.parsers import (
 from mcp_server_rag.reranker import RerankerProvider, get_reranker_provider
 from mcp_server_rag.s3_storage import build_s3_health_report, get_s3_storage_adapter
 from mcp_server_rag.splitter import recursive_split_text
+from mcp_server_rag.tasks import ProgressCallback, get_ingestion_task_manager
 from mcp_server_rag.vector_store import VectorStoreAdapter, get_vector_store
 
 # 兼容 FastMCP 类型别名
@@ -651,6 +654,8 @@ def rag_index_text(
     text: str,
     title: str,
     metadata: dict[str, Any] | None = None,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
 ) -> dict[str, Any]:
     """对单段纯文本内容进行切片、计算高维向量嵌入并持久化索引到指定知识库中。
 
@@ -663,6 +668,8 @@ def rag_index_text(
         text: 待索引的正文纯文本内容
         title: 文档标题或唯一标识（在知识库中作为 doc_id）
         metadata: 可选的附加结构化元数据（标签、分类、作者等）
+        archive_remote_images: 单次覆盖是否归档远程外链图片；为 ``None`` 时沿用全局配置
+        extract_images: 是否提取并转写文档图片资产，默认 ``True``
 
     Returns:
         dict[str, Any]: 索引执行结果状态字典
@@ -710,6 +717,8 @@ def rag_index_text(
         kb_name,
         doc_id,
         raw_text,
+        archive_remote_images=archive_remote_images,
+        extract_images=extract_images,
     )
     chunks = recursive_split_text(
         prepared_assets.processed_text,
@@ -755,23 +764,96 @@ def rag_index_text(
     }
 
 
-def rag_index_file(
+def _precheck_index_file(kb_name: str, file_path: str) -> dict[str, Any] | None:
+    """前置校验单文件摄取的只读限制、文件存在性与目标知识库写权限。"""
+    settings = get_settings()
+    if settings.read_only:
+        return {"success": False, "message": READ_ONLY_BLOCK_MSG}
+
+    path = Path(file_path).resolve()
+    if not path.exists():
+        return {"success": False, "message": f"文件不存在: {file_path}"}
+    if not path.is_file():
+        return {"success": False, "message": f"目标路径不是普通文件: {file_path}"}
+
+    if is_office_document(path):
+        ensure_office_dependency(path)
+
+    catalog, _ = _get_services()
+    return _validate_kb_for_write(catalog, kb_name, settings)
+
+
+def _precheck_index_directory(kb_name: str, dir_path: str) -> dict[str, Any] | None:
+    """前置校验目录摄取的只读限制、目录存在性与目标知识库写权限。"""
+    settings = get_settings()
+    if settings.read_only:
+        return {"success": False, "message": READ_ONLY_BLOCK_MSG}
+
+    path = Path(dir_path).resolve()
+    if not path.exists() or not path.is_dir():
+        return {"success": False, "message": f"目录不存在或不是有效目录: {dir_path}"}
+
+    catalog, _ = _get_services()
+    return _validate_kb_for_write(catalog, kb_name, settings)
+
+
+def rag_get_task_status(task_id: str) -> dict[str, Any]:
+    """查询后台异步文档摄取任务的执行进度、状态与最终结果。
+
+    Args:
+        task_id: 由 ``rag_index_file(..., background=True)`` 或
+            ``rag_index_directory(..., background=True)`` 返回的后台任务唯一标识。
+
+    Returns:
+        dict[str, Any]: 包含任务状态（``pending`` / ``running`` / ``completed`` / ``failed``）、
+        当前进度、结果或异常说明的字典。
+    """
+    return get_ingestion_task_manager().get_status(task_id)
+
+
+def _compute_embeddings_with_progress(
+    embedding_provider: Any,
+    embedding_texts: list[str],
+    *,
+    batch_size: int,
+    progress_callback: ProgressCallback | None,
+    base_step: int,
+    total_steps: int,
+) -> list[list[float]]:
+    """按配置分片大小执行向量化并在每批完成后汇报进度，兼容 FastEmbed 与远端 API。"""
+    if progress_callback is None or len(embedding_texts) <= batch_size:
+        vectors: list[list[float]] = embedding_provider.embed_texts(embedding_texts)
+        if progress_callback is not None:
+            progress_callback(
+                float(base_step + 1),
+                float(total_steps),
+                f"已完成切片向量化 ({len(embedding_texts)}/{len(embedding_texts)})",
+            )
+        return vectors
+
+    all_vectors: list[list[float]] = []
+    total_texts = len(embedding_texts)
+    for batch_idx, start in enumerate(range(0, total_texts, batch_size), start=1):
+        batch = embedding_texts[start : start + batch_size]
+        all_vectors.extend(embedding_provider.embed_texts(batch))
+        done = min(start + len(batch), total_texts)
+        progress_callback(
+            float(base_step + batch_idx),
+            float(total_steps),
+            f"正在向量化切片 ({done}/{total_texts})",
+        )
+    return all_vectors
+
+
+def _execute_rag_index_file(
     kb_name: str,
     file_path: str,
     metadata: dict[str, Any] | None = None,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """摄取本地单个文件，自动识别文件格式并进行结构感知切片、向量嵌入与持久化索引。
-
-    支持 SHA-256 内容指纹校验与幂等更新（若文件未修改则秒级跳过）。
-
-    Args:
-        kb_name: 目标知识库名称
-        file_path: 本地文件绝对或相对路径
-        metadata: 可选的附加结构化元数据（标签、分类等）
-
-    Returns:
-        dict[str, Any]: 索引结果状态字典
-    """
+    """执行单文件摄取核心逻辑并按阶段向可选进度回调汇报执行状态。"""
     settings = get_settings()
     if settings.read_only:
         return {
@@ -816,6 +898,8 @@ def rag_index_file(
     # 2. 幂等指纹比对
     existing = catalog.get_document_by_id(kb_name, doc_id)
     if existing and existing["content_hash"] == content_hash:
+        if progress_callback is not None:
+            progress_callback(1.0, 1.0, f"文档 '{title}' 内容未变动，已跳过")
         return {
             "success": True,
             "status": "skipped",
@@ -830,7 +914,12 @@ def rag_index_file(
     ext = path.suffix.lower()
     if is_office:
         try:
-            parsed_office = parse_office_document(path, kb_name=kb_name, doc_id=doc_id)
+            parsed_office = parse_office_document(
+                path,
+                kb_name=kb_name,
+                doc_id=doc_id,
+                extract_images=extract_images,
+            )
         except ImportError:
             raise
         except Exception as exc:
@@ -846,6 +935,8 @@ def rag_index_file(
             doc_id,
             raw_content,
             pre_extracted_images=parsed_office.images,
+            archive_remote_images=archive_remote_images,
+            extract_images=extract_images,
         )
         chunks = dispatch_and_split(
             file_path=path,
@@ -869,6 +960,8 @@ def rag_index_file(
             doc_id,
             normalized_html,
             base_dir=path.parent,
+            archive_remote_images=archive_remote_images,
+            extract_images=extract_images,
         )
         chunks = (
             recursive_split_text(
@@ -889,6 +982,8 @@ def rag_index_file(
             doc_id,
             raw_content,
             base_dir=path.parent,
+            archive_remote_images=archive_remote_images,
+            extract_images=extract_images,
         )
         chunks = dispatch_and_split(
             file_path=path,
@@ -910,9 +1005,33 @@ def rag_index_file(
             chunks = [raw_content]
 
     # 3. 提前完成向量计算，确保 S3 校验或嵌入失败时不误删存量版本
+    batch_size = max(1, settings.embedding_batch_size)
+    num_embed_batches = max(1, math.ceil(len(chunks) / batch_size))
+    total_steps = num_embed_batches + 3
+    if progress_callback is not None:
+        progress_callback(
+            1.0,
+            float(total_steps),
+            f"已解析文档 '{title}'（共 {len(chunks)} 个切片），准备向量化",
+        )
+
     embedding_provider = get_embedding_provider(settings)
     embedding_texts = [build_embedding_text(chunk) for chunk in chunks]
-    precomputed_embeddings = embedding_provider.embed_texts(embedding_texts)
+    precomputed_embeddings = _compute_embeddings_with_progress(
+        embedding_provider,
+        embedding_texts,
+        batch_size=batch_size,
+        progress_callback=progress_callback,
+        base_step=1,
+        total_steps=total_steps,
+    )
+
+    if progress_callback is not None:
+        progress_callback(
+            float(1 + num_embed_batches + 1),
+            float(total_steps),
+            f"正在持久化切片与资产元数据: {title}",
+        )
 
     # 4. 协同写入文档元数据、向量切片与图片资产（含失败补偿回滚及陈旧资产清理）
     path_hash = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:8]
@@ -942,6 +1061,9 @@ def rag_index_file(
         prepared_assets=prepared_assets,
     )
 
+    if progress_callback is not None:
+        progress_callback(float(total_steps), float(total_steps), f"文档 '{title}' 摄取完成")
+
     return {
         "success": True,
         "status": status,
@@ -951,6 +1073,57 @@ def rag_index_file(
         "content_hash": content_hash,
         "message": f"File '{title}' successfully {status}",
     }
+
+
+def rag_index_file(
+    kb_name: str,
+    file_path: str,
+    metadata: dict[str, Any] | None = None,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
+    background: bool = False,
+) -> dict[str, Any]:
+    """摄取本地单个文件，自动识别文件格式并进行结构感知切片、向量嵌入与持久化索引。
+
+    支持 SHA-256 内容指纹校验与幂等更新（若文件未修改则秒级跳过）。
+
+    Args:
+        kb_name: 目标知识库名称
+        file_path: 本地文件绝对或相对路径
+        metadata: 可选的附加结构化元数据（标签、分类等）
+        archive_remote_images: 单次覆盖是否归档远程外链图片；为 ``None`` 时沿用全局配置
+        extract_images: 是否提取并转写文档图片资产，默认 ``True``（为 ``False`` 时跳过图片加速摄取）
+        background: 是否在后台异步执行大文档摄取并立即返回 ``task_id``，默认 ``False``
+
+    Returns:
+        dict[str, Any]: 索引结果状态字典（``background=True`` 时返回任务受理信息与 ``task_id``）
+    """
+    if background:
+        err = _precheck_index_file(kb_name, file_path)
+        if err:
+            return err
+        resolved_target = str(Path(file_path).resolve())
+        return get_ingestion_task_manager().submit(
+            task_type="index_file",
+            target=resolved_target,
+            lock_key=f"{kb_name}:{resolved_target}",
+            runner=lambda cb: _execute_rag_index_file(
+                kb_name=kb_name,
+                file_path=file_path,
+                metadata=metadata,
+                archive_remote_images=archive_remote_images,
+                extract_images=extract_images,
+                progress_callback=cb,
+            ),
+        )
+
+    return _execute_rag_index_file(
+        kb_name=kb_name,
+        file_path=file_path,
+        metadata=metadata,
+        archive_remote_images=archive_remote_images,
+        extract_images=extract_images,
+    )
 
 
 IGNORED_DIR_NAMES: set[str] = {
@@ -998,25 +1171,17 @@ IGNORED_FILE_EXTENSIONS: set[str] = {
 }
 
 
-def rag_index_directory(
+def _execute_rag_index_directory(
     kb_name: str,
     dir_path: str,
     glob_pattern: str = "**/*",
     max_files: int = 200,
     recursive: bool = True,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict[str, Any]:
-    """批量扫描并摄取本地目录下的所有文件，支持递归遍历与 max_files 超时防御截断。
-
-    Args:
-        kb_name: 目标知识库名称
-        dir_path: 目标目录绝对或相对路径
-        glob_pattern: 匹配文件模式（默认为 "**/*"）
-        max_files: 目录文件摄取上限，防止大目录导致 MCP 响应超时（默认 200）
-        recursive: 是否递归扫描子目录（默认 True）
-
-    Returns:
-        dict[str, Any]: 目录批量摄取统计报告字典
-    """
+    """执行目录批量扫描与文件摄取，支持按文件进度回调。"""
     settings = get_settings()
     if settings.read_only:
         return {
@@ -1075,9 +1240,40 @@ def rag_index_directory(
     skipped_count = 0
     failed_count = 0
 
-    for file_p in files_to_process:
+    total_to_process = len(files_to_process)
+    if progress_callback is not None:
+        progress_callback(
+            0.0,
+            float(max(1, total_to_process)),
+            f"目录扫描发现 {total_found} 个文件，准备处理 {total_to_process} 个",
+        )
+
+    for idx, file_p in enumerate(files_to_process, start=1):
+        child_cb: ProgressCallback | None = None
+        if progress_callback is not None:
+
+            def _make_child_cb(file_idx: int, file_name: str) -> ProgressCallback:
+                def _child(sub_prog: float, sub_total: float, sub_msg: str) -> None:
+                    ratio = min(1.0, max(0.0, sub_prog / max(1.0, sub_total)))
+                    mapped = float(file_idx - 1) + ratio
+                    progress_callback(
+                        mapped,
+                        float(max(1, total_to_process)),
+                        f"[{file_idx}/{total_to_process}] {file_name}: {sub_msg}",
+                    )
+
+                return _child
+
+            child_cb = _make_child_cb(idx, file_p.name)
+
         try:
-            res = rag_index_file(kb_name=kb_name, file_path=str(file_p))
+            res = _execute_rag_index_file(
+                kb_name=kb_name,
+                file_path=str(file_p),
+                archive_remote_images=archive_remote_images,
+                extract_images=extract_images,
+                progress_callback=child_cb,
+            )
         except ImportError as exc:
             res = {"success": False, "message": str(exc)}
         status = res.get("status", "failed") if res.get("success") else "failed"
@@ -1098,6 +1294,12 @@ def rag_index_directory(
                 "message": res.get("message", ""),
             }
         )
+        if progress_callback is not None:
+            progress_callback(
+                float(idx),
+                float(max(1, total_to_process)),
+                f"已完成第 {idx}/{total_to_process} 个文件: {file_p.name} ({status})",
+            )
 
     msg = (
         f"目录扫描发现 {total_found} 个候选文件，"
@@ -1107,6 +1309,8 @@ def rag_index_directory(
     )
     if truncated:
         msg += f" [警告: 超过 max_files={max_files} 限制，已执行截断]"
+    if progress_callback is not None and total_to_process == 0:
+        progress_callback(1.0, 1.0, msg)
 
     return {
         "success": True,
@@ -1123,10 +1327,69 @@ def rag_index_directory(
     }
 
 
+def rag_index_directory(
+    kb_name: str,
+    dir_path: str,
+    glob_pattern: str = "**/*",
+    max_files: int = 200,
+    recursive: bool = True,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
+    background: bool = False,
+) -> dict[str, Any]:
+    """批量扫描并摄取本地目录下的所有文件，支持递归遍历与 max_files 超时防御截断。
+
+    Args:
+        kb_name: 目标知识库名称
+        dir_path: 目标目录绝对或相对路径
+        glob_pattern: 匹配文件模式（默认为 "**/*"）
+        max_files: 目录文件摄取上限，防止大目录导致 MCP 响应超时（默认 200）
+        recursive: 是否递归扫描子目录（默认 True）
+        archive_remote_images: 单次覆盖是否归档远程外链图片；为 ``None`` 时沿用全局配置
+        extract_images: 是否提取并转写文档图片资产，默认 ``True``
+        background: 是否在后台异步执行目录摄取并立即返回 ``task_id``，默认 ``False``
+
+    Returns:
+        dict[str, Any]: 目录批量摄取统计报告字典（``background=True`` 时返回 ``task_id``）
+    """
+    if background:
+        err = _precheck_index_directory(kb_name, dir_path)
+        if err:
+            return err
+        resolved_dir = str(Path(dir_path).resolve())
+        return get_ingestion_task_manager().submit(
+            task_type="index_directory",
+            target=resolved_dir,
+            lock_key=f"{kb_name}:{resolved_dir}",
+            runner=lambda cb: _execute_rag_index_directory(
+                kb_name=kb_name,
+                dir_path=dir_path,
+                glob_pattern=glob_pattern,
+                max_files=max_files,
+                recursive=recursive,
+                archive_remote_images=archive_remote_images,
+                extract_images=extract_images,
+                progress_callback=cb,
+            ),
+        )
+
+    return _execute_rag_index_directory(
+        kb_name=kb_name,
+        dir_path=dir_path,
+        glob_pattern=glob_pattern,
+        max_files=max_files,
+        recursive=recursive,
+        archive_remote_images=archive_remote_images,
+        extract_images=extract_images,
+    )
+
+
 def rag_index_url(
     kb_name: str,
     url: str,
     metadata: dict[str, Any] | None = None,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
 ) -> dict[str, Any]:
     """通过 HTTP 请求抓取在线网页或在线文档，清洗 HTML 视觉噪点并进行向量索引。
 
@@ -1136,6 +1399,8 @@ def rag_index_url(
         kb_name: 目标知识库名称
         url: 目标网页或在线文档的完整 URL（必须以 http:// 或 https:// 开头）
         metadata: 可选的附加结构化元数据字典
+        archive_remote_images: 单次覆盖是否归档远程外链图片；为 ``None`` 时沿用全局配置
+        extract_images: 是否提取并转写页面图片资产，默认 ``True``
 
     Returns:
         dict[str, Any]: 索引结果状态字典
@@ -1225,6 +1490,8 @@ def rag_index_url(
         doc_id,
         text_content,
         source_url=clean_url,
+        archive_remote_images=archive_remote_images,
+        extract_images=extract_images,
     )
     if "markdown" in content_type:
         chunks = split_markdown(
@@ -1849,6 +2116,88 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     server.add_tool(rag_search)
     server.add_tool(rag_query_with_context)
 
+    def _make_progress_reporter(ctx: Context | None) -> ProgressCallback | None:
+        if ctx is None:
+            return None
+
+        def _report(progress: float, total: float, message: str) -> None:
+            try:
+                anyio.from_thread.run(ctx.report_progress, progress, total, message)
+            except Exception as exc:
+                logger.debug("FastMCP 进度回调推送失败（已忽略不阻断摄取）: %s", exc)
+
+        return _report
+
+    async def _mcp_rag_index_file(
+        kb_name: str,
+        file_path: str,
+        metadata: dict[str, Any] | None = None,
+        archive_remote_images: bool | None = None,
+        extract_images: bool = True,
+        background: bool = False,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        if background:
+            return await anyio.to_thread.run_sync(
+                lambda: rag_index_file(
+                    kb_name=kb_name,
+                    file_path=file_path,
+                    metadata=metadata,
+                    archive_remote_images=archive_remote_images,
+                    extract_images=extract_images,
+                    background=True,
+                )
+            )
+        reporter = _make_progress_reporter(ctx)
+        return await anyio.to_thread.run_sync(
+            lambda: _execute_rag_index_file(
+                kb_name=kb_name,
+                file_path=file_path,
+                metadata=metadata,
+                archive_remote_images=archive_remote_images,
+                extract_images=extract_images,
+                progress_callback=reporter,
+            )
+        )
+
+    async def _mcp_rag_index_directory(
+        kb_name: str,
+        dir_path: str,
+        glob_pattern: str = "**/*",
+        max_files: int = 200,
+        recursive: bool = True,
+        archive_remote_images: bool | None = None,
+        extract_images: bool = True,
+        background: bool = False,
+        ctx: Context | None = None,
+    ) -> dict[str, Any]:
+        if background:
+            return await anyio.to_thread.run_sync(
+                lambda: rag_index_directory(
+                    kb_name=kb_name,
+                    dir_path=dir_path,
+                    glob_pattern=glob_pattern,
+                    max_files=max_files,
+                    recursive=recursive,
+                    archive_remote_images=archive_remote_images,
+                    extract_images=extract_images,
+                    background=True,
+                )
+            )
+        reporter = _make_progress_reporter(ctx)
+        return await anyio.to_thread.run_sync(
+            lambda: _execute_rag_index_directory(
+                kb_name=kb_name,
+                dir_path=dir_path,
+                glob_pattern=glob_pattern,
+                max_files=max_files,
+                recursive=recursive,
+                archive_remote_images=archive_remote_images,
+                extract_images=extract_images,
+                progress_callback=reporter,
+            )
+        )
+
     # 2. 若处于读写模式，注册写操作与索引工具；只读模式下物理隐藏
     if not cfg.read_only:
         server.add_tool(rag_create_kb)
@@ -1856,9 +2205,18 @@ def create_server(settings: Settings | None = None) -> FastMCP:
         server.add_tool(rag_delete_kb)
         server.add_tool(rag_delete_document)
         server.add_tool(rag_index_text)
-        server.add_tool(rag_index_file)
-        server.add_tool(rag_index_directory)
+        server.add_tool(
+            _mcp_rag_index_file,
+            name="rag_index_file",
+            description=rag_index_file.__doc__,
+        )
+        server.add_tool(
+            _mcp_rag_index_directory,
+            name="rag_index_directory",
+            description=rag_index_directory.__doc__,
+        )
         server.add_tool(rag_index_url)
+        server.add_tool(rag_get_task_status)
 
     return server
 

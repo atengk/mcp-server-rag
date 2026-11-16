@@ -15,6 +15,7 @@ import html
 import logging
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -150,6 +151,39 @@ def _transform_outside_fenced_blocks(
     return "".join(parts)
 
 
+def _resolve_remote_url(raw_url: str, source_url: str | None) -> str:
+    """规范化远程图片 URL，并在存在网页来源地址时解析相对外链。"""
+    target_url = raw_url.strip()
+    if source_url and not urlparse(target_url).scheme:
+        target_url = urljoin(source_url, target_url)
+    return target_url
+
+
+def _should_skip_remote_image(
+    url: str,
+    skip_domains: tuple[str, ...],
+    skip_extensions: tuple[str, ...],
+) -> bool:
+    """根据配置的跳过域名与文件后缀判断是否忽略该远程图片外链（如徽章与 SVG）。"""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    for raw_domain in skip_domains:
+        domain = raw_domain.strip().lower().lstrip(".")
+        if domain and (host == domain or host.endswith(f".{domain}")):
+            return True
+
+    suffix = Path(unquote(parsed.path)).suffix.lower()
+    if suffix:
+        normalized_exts = {
+            ext if ext.startswith(".") else f".{ext}"
+            for ext in (e.strip().lower() for e in skip_extensions)
+            if ext
+        }
+        if suffix in normalized_exts:
+            return True
+    return False
+
+
 def prepare_document_assets(
     settings: Settings,
     kb_name: str,
@@ -160,6 +194,8 @@ def prepare_document_assets(
     source_url: str | None = None,
     pre_extracted_images: list[ExtractedImage] | None = None,
     s3_client: Any | None = None,
+    archive_remote_images: bool | None = None,
+    extract_images: bool = True,
 ) -> PreparedDocumentAssets:
     """收集并归一化文档内的图片资产（内嵌图/局部相对路径图/安全归档外链），完成正文引用转写。
 
@@ -172,11 +208,25 @@ def prepare_document_assets(
         source_url: 在线网页摄取时的来源页面 URL（用于解析网页相对图链）。
         pre_extracted_images: 已由二进制文档解析器提取并打桩的图片资产列表。
         s3_client: 可选自定义 S3 客户端（主要用于测试）。
+        archive_remote_images: 单次覆盖是否抓取归档远程外链图片；为 ``None`` 时沿用 ``settings``。
+        extract_images: 是否提取并转写文档图片资产；为 ``False`` 时跳过全部图片提取与外链抓取。
 
     Returns:
         包含转写后正文、待落盘图片清单与已校验 S3 适配器的 ``PreparedDocumentAssets``。
     """
     storage_type = _validate_storage_type(settings.storage_type)
+    if not extract_images:
+        return PreparedDocumentAssets(
+            processed_text=text_content,
+            images=[],
+            s3_adapter=None,
+            blocked_remote_urls=[],
+            archived_remote_count=0,
+        )
+
+    should_archive_remote = (
+        settings.archive_remote_images if archive_remote_images is None else archive_remote_images
+    )
     doc_key = make_asset_doc_key(doc_id)
 
     images: list[ExtractedImage] = list(pre_extracted_images or [])
@@ -187,11 +237,12 @@ def prepare_document_assets(
 
     local_path_cache: dict[Path, str | None] = {}
     remote_url_cache: dict[str, str | None] = {}
+    pending_remote_targets: list[tuple[str, str]] = []
+    queued_remote_urls: set[str] = set()
     blocked_remote_urls: list[str] = []
     archived_remote_count = 0
 
     def _collect_and_map(match: re.Match[str]) -> str | None:
-        nonlocal archived_remote_count
         alt, raw_url = _parse_image_tag(match)
         if not raw_url or raw_url.startswith("#") or raw_url.lower().startswith("javascript:"):
             return None
@@ -243,50 +294,29 @@ def prepare_document_assets(
             local_path_cache[img_path] = unique_name
             return unique_name
 
-        # 3. 远程外链（仅在显式开启 MCP_RAG_ARCHIVE_REMOTE_IMAGES=true 时抓取归档）
-        if not settings.archive_remote_images:
+        # 3. 远程外链（仅在开启归档且未命中跳过策略时登记并发抓取）
+        if not should_archive_remote:
             return None
 
-        target_url = raw_url.strip()
-        if source_url and not urlparse(target_url).scheme:
-            target_url = urljoin(source_url, target_url)
+        target_url = _resolve_remote_url(raw_url, source_url)
 
-        if target_url in remote_url_cache:
-            return remote_url_cache[target_url]
+        if target_url in queued_remote_urls:
+            return None
+        queued_remote_urls.add(target_url)
 
-        try:
-            remote_img = download_safe_remote_image(
-                target_url,
-                alt=alt,
-                timeout_seconds=settings.remote_image_timeout_seconds,
-                max_bytes=settings.remote_image_max_bytes,
-            )
-        except SSRFBlockedError as exc:
-            logger.warning("SSRF 防护拦截远程图片外链 (%s): %s", target_url, exc)
-            blocked_remote_urls.append(target_url)
+        if _should_skip_remote_image(
+            target_url,
+            settings.remote_image_skip_domains,
+            settings.remote_image_skip_extensions,
+        ):
+            logger.debug("按跳过策略忽略远程图片外链: %s", target_url)
             remote_url_cache[target_url] = None
             return None
 
-        if remote_img is None:
-            remote_url_cache[target_url] = None
-            return None
+        pending_remote_targets.append((target_url, alt))
+        return None
 
-        unique_name = deduplicate_filename(remote_img.filename, used_lower_filenames)
-        normalized_remote = ExtractedImage(
-            filename=unique_name,
-            data=remote_img.data,
-            mime_type=remote_img.mime_type,
-            alt=remote_img.alt,
-            width=remote_img.width,
-            height=remote_img.height,
-            byte_size=remote_img.byte_size,
-        )
-        images.append(normalized_remote)
-        remote_url_cache[target_url] = unique_name
-        archived_remote_count += 1
-        return unique_name
-
-    # 第一遍：收集有效图片并生成待替换 URL 映射
+    # 第一遍：收集内嵌与本地相对图片，并队列化待抓取远程外链
     s3_adapter: S3AssetStorageAdapter | None = None
     url_filename_pairs: list[tuple[re.Match[str], str]] = []
 
@@ -297,6 +327,52 @@ def prepare_document_assets(
         return match.group(0)
 
     _transform_outside_fenced_blocks(text_content, _collect_pass)
+
+    # 第二步：受限并发抓取远程外链图片，并按文档出现顺序确定性去重归档
+    if pending_remote_targets:
+
+        def _fetch_one(item: tuple[str, str]) -> tuple[str, ExtractedImage | None, str | None]:
+            url, img_alt = item
+            try:
+                img = download_safe_remote_image(
+                    url,
+                    alt=img_alt,
+                    timeout_seconds=settings.remote_image_timeout_seconds,
+                    max_bytes=settings.remote_image_max_bytes,
+                )
+                return url, img, None
+            except SSRFBlockedError as exc:
+                return url, None, str(exc)
+
+        workers = min(settings.remote_image_concurrency, len(pending_remote_targets))
+        if workers <= 1:
+            fetch_results = [_fetch_one(item) for item in pending_remote_targets]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                fetch_results = list(executor.map(_fetch_one, pending_remote_targets))
+
+        for target_url, remote_img, blocked_reason in fetch_results:
+            if blocked_reason is not None:
+                logger.warning("SSRF 防护拦截远程图片外链 (%s): %s", target_url, blocked_reason)
+                blocked_remote_urls.append(target_url)
+                remote_url_cache[target_url] = None
+                continue
+            if remote_img is None:
+                remote_url_cache[target_url] = None
+                continue
+            unique_name = deduplicate_filename(remote_img.filename, used_lower_filenames)
+            normalized_remote = ExtractedImage(
+                filename=unique_name,
+                data=remote_img.data,
+                mime_type=remote_img.mime_type,
+                alt=remote_img.alt,
+                width=remote_img.width,
+                height=remote_img.height,
+                byte_size=remote_img.byte_size,
+            )
+            images.append(normalized_remote)
+            remote_url_cache[target_url] = unique_name
+            archived_remote_count += 1
 
     if storage_type == "s3" and images:
         s3_adapter = get_s3_storage_adapter(settings, client=s3_client)
@@ -322,16 +398,17 @@ def prepare_document_assets(
             img_path = _resolve_relative_image_file(base_dir, raw_url)
             if img_path is not None:
                 return local_path_cache.get(img_path)
-        if settings.archive_remote_images:
-            target_url = raw_url.strip()
-            if source_url and not urlparse(target_url).scheme:
-                target_url = urljoin(source_url, target_url)
+        if should_archive_remote:
+            target_url = _resolve_remote_url(raw_url, source_url)
             return remote_url_cache.get(target_url)
         return None
 
+    has_rewrites = bool(url_filename_pairs) or any(
+        val is not None for val in remote_url_cache.values()
+    )
     rewritten_text = (
         _transform_outside_fenced_blocks(text_content, _rewrite_pass)
-        if url_filename_pairs
+        if has_rewrites
         else text_content
     )
 

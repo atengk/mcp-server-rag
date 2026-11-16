@@ -31,6 +31,8 @@ class _ProviderCacheKey:
     api_key: str
     model_name: str
     dimension: int | None
+    timeout_seconds: int
+    batch_size: int
 
 
 # 按配置签名缓存单例，避免重复加载 ONNX 模型或反复触发网络维度探针
@@ -57,6 +59,8 @@ def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
         api_key=settings.embedding_api_key,
         model_name=settings.embedding_model,
         dimension=settings.embedding_dimension,
+        timeout_seconds=settings.embedding_timeout_seconds,
+        batch_size=settings.embedding_batch_size,
     )
 
     with _CACHE_LOCK:
@@ -74,6 +78,8 @@ def get_embedding_provider(settings: Settings) -> EmbeddingProvider:
             base_url=settings.embedding_base_url,
             api_key=settings.embedding_api_key,
             dimension=settings.embedding_dimension,
+            timeout=float(settings.embedding_timeout_seconds),
+            batch_size=settings.embedding_batch_size,
         )
     else:
         raise ValueError(

@@ -50,6 +50,7 @@ from mcp_server_rag.server import (
     rag_delete_document,
     rag_delete_kb,
     rag_doctor,
+    rag_index_directory,
     rag_index_file,
     rag_index_text,
     rag_index_url,
@@ -234,6 +235,9 @@ def isolated_gateway_env() -> Generator[Path, None, None]:
         "MCP_RAG_ARCHIVE_REMOTE_IMAGES",
         "MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS",
         "MCP_RAG_REMOTE_IMAGE_MAX_BYTES",
+        "MCP_RAG_REMOTE_IMAGE_CONCURRENCY",
+        "MCP_RAG_REMOTE_IMAGE_SKIP_DOMAINS",
+        "MCP_RAG_REMOTE_IMAGE_SKIP_EXTENSIONS",
     ]
     backup = {k: os.environ.get(k) for k in env_keys}
     for k in env_keys:
@@ -1016,3 +1020,215 @@ def test_rag_doctor_s3_connectivity_and_auto_create_bucket(
     assert auth_report["s3_bucket_exists"] is None
     assert auth_report["status"] == "degraded"
     assert "AccessDenied" in auth_report["storage_error"] or "鉴权" in auth_report["storage_error"]
+
+
+def test_remote_image_concurrent_download_skip_rules_and_overrides(
+    isolated_gateway_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证远程图片并发抓取、徽章域名/后缀过滤与单次开关覆盖契约 (Issue #21 Seam A)。"""
+    import threading
+    import time
+
+    from mcp_server_rag.asset_gateway import prepare_document_assets
+
+    png_bytes = _make_png_bytes(160, 160)
+    requested_urls: list[str] = []
+    lock = threading.Lock()
+    active_count = 0
+    max_active = 0
+
+    monkeypatch.setattr(
+        "mcp_server_rag.remote_images._resolve_host_ips",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active_count, max_active
+        with lock:
+            requested_urls.append(str(request.url))
+            active_count += 1
+            max_active = max(max_active, active_count)
+        try:
+            time.sleep(0.12)
+            return httpx.Response(
+                200,
+                headers={"Content-Type": "image/png"},
+                content=png_bytes,
+            )
+        finally:
+            with lock:
+                active_count -= 1
+
+    transport = httpx.MockTransport(_handler)
+    orig_client = httpx.Client
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda *args, **kwargs: orig_client(transport=transport, **kwargs),
+    )
+
+    # 1. 默认跳过 img.shields.io 与 .svg，仅并发抓取有效外链且保持输出顺序与去重确定性
+    os.environ["MCP_RAG_ARCHIVE_REMOTE_IMAGES"] = "true"
+    os.environ["MCP_RAG_REMOTE_IMAGE_CONCURRENCY"] = "4"
+    settings = get_settings()
+    assert settings.remote_image_concurrency == 4
+    assert "img.shields.io" in settings.remote_image_skip_domains
+    assert ".svg" in settings.remote_image_skip_extensions
+
+    md_text = (
+        "![CI](https://img.shields.io/github/actions/workflow/status/atengk/mcp-server-rag/ci.yml)\n"
+        "![Vector](https://cdn.safe.example/icon.svg)\n"
+        "![图A](https://cdn.safe.example/a/diagram.png)\n"
+        "![图B](https://cdn.safe.example/b/diagram.png)\n"
+        "![图C](https://cdn.safe.example/c/chart.png)\n"
+        "![图D](https://cdn.safe.example/d/arch.png)\n"
+    )
+    prepared = prepare_document_assets(
+        settings,
+        kb_name="gw_kb",
+        doc_id="conc_doc",
+        text_content=md_text,
+    )
+    assert max_active >= 2
+    assert len(requested_urls) == 4
+    assert all("img.shields.io" not in u and not u.endswith(".svg") for u in requested_urls)
+    assert [img.filename for img in prepared.images] == [
+        "diagram.png",
+        "diagram_2.png",
+        "chart.png",
+        "arch.png",
+    ]
+    assert prepared.archived_remote_count == 4
+
+    # 2. 单次 archive_remote_images=False 覆盖全局 true，零外网请求
+    requested_urls.clear()
+    no_remote = prepare_document_assets(
+        settings,
+        kb_name="gw_kb",
+        doc_id="conc_doc_no_remote",
+        text_content="![图A](https://cdn.safe.example/a/diagram.png)",
+        archive_remote_images=False,
+    )
+    assert requested_urls == []
+    assert no_remote.images == []
+
+    # 3. 单次 archive_remote_images=True 覆盖全局 false
+    os.environ["MCP_RAG_ARCHIVE_REMOTE_IMAGES"] = "false"
+    off_settings = get_settings()
+    with_remote = prepare_document_assets(
+        off_settings,
+        kb_name="gw_kb",
+        doc_id="conc_doc_force_remote",
+        text_content="![图A](https://cdn.safe.example/a/diagram.png)",
+        archive_remote_images=True,
+    )
+    assert len(requested_urls) == 1
+    assert len(with_remote.images) == 1
+
+    # 4. extract_images=False 时跳过本地、内嵌与外链全部图片提取
+    local_img = isolated_gateway_env / "local.png"
+    local_img.write_bytes(png_bytes)
+    requested_urls.clear()
+    raw_mix = "![本地](./local.png) ![外链](https://cdn.safe.example/a/diagram.png)"
+    no_extract = prepare_document_assets(
+        settings,
+        kb_name="gw_kb",
+        doc_id="conc_doc_no_extract",
+        text_content=raw_mix,
+        base_dir=isolated_gateway_env,
+        archive_remote_images=True,
+        extract_images=False,
+    )
+    assert requested_urls == []
+    assert no_extract.images == []
+    assert no_extract.processed_text == raw_mix
+
+
+def test_remote_image_timeout_split_and_tool_override_switches(
+    isolated_gateway_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证远程图片连接/读取超时拆分及工具入参单次覆盖开关 (Issue #21 Seam B)。"""
+    captured_timeouts: list[httpx.Timeout] = []
+    requested_urls: list[str] = []
+    png_bytes = _make_png_bytes(160, 160)
+
+    monkeypatch.setattr(
+        "mcp_server_rag.remote_images._resolve_host_ips",
+        lambda host, port: ["93.184.216.34"],
+    )
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(200, headers={"Content-Type": "image/png"}, content=png_bytes)
+
+    transport = httpx.MockTransport(_handler)
+    orig_client = httpx.Client
+
+    def _spy_client(*args: Any, **kwargs: Any) -> httpx.Client:
+        if "timeout" in kwargs and isinstance(kwargs["timeout"], httpx.Timeout):
+            captured_timeouts.append(kwargs["timeout"])
+        return orig_client(transport=transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _spy_client)
+
+    # 1. 默认超时拆分：connect 封顶 5.0s，read 使用默认 8.0s
+    img = download_safe_remote_image("https://cdn.safe.example/arch.png")
+    assert img is not None
+    assert captured_timeouts
+    assert captured_timeouts[0].connect == 5.0
+    assert captured_timeouts[0].read == 8.0
+
+    # 2. 工具层单次关闭 archive_remote_images / extract_images
+    assert rag_create_kb(name="override_kb")["success"] is True
+    os.environ["MCP_RAG_ARCHIVE_REMOTE_IMAGES"] = "true"
+
+    docs_dir = isolated_gateway_env / "docs"
+    docs_dir.mkdir(parents=True)
+    (docs_dir / "local.png").write_bytes(png_bytes)
+    md_file = docs_dir / "readme.md"
+    md_file.write_text(
+        "# 架构说明\n\n![本地](./local.png)\n\n![外链](https://cdn.safe.example/remote.png)\n",
+        encoding="utf-8",
+    )
+
+    requested_urls.clear()
+    res_no_remote = rag_index_file(
+        kb_name="override_kb",
+        file_path=str(md_file),
+        archive_remote_images=False,
+    )
+    assert res_no_remote["success"] is True
+    assert requested_urls == []
+
+    # 本地图片应已被提取，而外链未下载
+    catalog = get_metadata_catalog(get_settings())
+    assets_after_no_remote = catalog.list_image_assets("override_kb", doc_id=str(md_file.resolve()))
+    assert [a["filename"] for a in assets_after_no_remote] == ["local.png"]
+
+    # 3. extract_images=False 通过目录摄取也跳过全部图片提取
+    md_file2 = docs_dir / "readme2.md"
+    md_file2.write_text(
+        "# 无图快速索引\n\n![本地](./local.png)\n\n![外链](https://cdn.safe.example/r2.png)\n",
+        encoding="utf-8",
+    )
+    dir_res = rag_index_directory(
+        kb_name="override_kb",
+        dir_path=str(docs_dir),
+        glob_pattern="readme2.md",
+        extract_images=False,
+    )
+    assert dir_res["success"] is True
+    assert requested_urls == []
+    assert catalog.list_image_assets("override_kb", doc_id=str(md_file2.resolve())) == []
+
+    # 4. rag_index_text 单次覆盖 archive_remote_images=False
+    txt_res = rag_index_text(
+        kb_name="override_kb",
+        title="txt_override",
+        text="![外链](https://cdn.safe.example/r3.png)",
+        archive_remote_images=False,
+    )
+    assert txt_res["success"] is True
+    assert requested_urls == []

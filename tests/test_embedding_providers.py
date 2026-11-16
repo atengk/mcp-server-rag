@@ -48,6 +48,10 @@ def isolated_env() -> Generator[str, None, None]:
         "MCP_RAG_EMBEDDING_API_KEY",
         "MCP_RAG_EMBEDDING_MODEL",
         "MCP_RAG_EMBEDDING_DIMENSION",
+        "MCP_RAG_EMBEDDING_TIMEOUT_SECONDS",
+        "MCP_RAG_EMBEDDING_BATCH_SIZE",
+        "MCP_RAG_CHUNK_SIZE",
+        "MCP_RAG_CHUNK_OVERLAP",
     ]
     backup = {k: os.environ.get(k) for k in env_keys}
     os.environ["MCP_RAG_DATA_DIR"] = temp_dir
@@ -386,3 +390,276 @@ def test_fastembed_default_dimension_empty_env_and_unsupported_provider() -> Non
     assert bad_report["status"] == "degraded"
     assert bad_report["embedding_status"] == "error"
     assert "unknown_vendor" in bad_report["embedding_error"]
+
+
+def test_embedding_timeout_wiring_and_batch_chunking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 MCP_RAG_EMBEDDING_TIMEOUT_SECONDS 接线、分批请求与缓存键隔离 (Issue #20 Seam A)。"""
+    from mcp_server_rag.config import get_settings
+    from mcp_server_rag.embedding import get_embedding_provider
+
+    captured_timeouts: list[Any] = []
+    batch_inputs: list[list[str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        inputs = body["input"]
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        batch_inputs.append(list(inputs))
+        data = [
+            {
+                "object": "embedding",
+                "index": i,
+                "embedding": [float(int(text.removeprefix("item_"))), 1.0, 2.0],
+            }
+            for i, text in enumerate(inputs)
+        ]
+        return httpx.Response(200, json={"object": "list", "data": data, "model": body["model"]})
+
+    mock_transport = httpx.MockTransport(_handler)
+
+    def _spy_client(*args: Any, **kwargs: Any) -> httpx.Client:
+        captured_timeouts.append(kwargs.get("timeout"))
+        return _REAL_HTTPX_CLIENT(transport=mock_transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "Client", _spy_client)
+
+    # 1. 默认值验证：timeout=30, batch_size=32
+    os.environ.pop("MCP_RAG_EMBEDDING_TIMEOUT_SECONDS", None)
+    os.environ.pop("MCP_RAG_EMBEDDING_BATCH_SIZE", None)
+    default_settings = get_settings()
+    assert default_settings.embedding_timeout_seconds == 30
+    assert default_settings.embedding_batch_size == 32
+
+    # 2. 自定义 timeout=12 & batch_size=3 透传并按分片发送请求
+    os.environ["MCP_RAG_EMBEDDING_PROVIDER"] = "ollama"
+    os.environ["MCP_RAG_EMBEDDING_MODEL"] = "qwen3-embedding:0.6b"
+    os.environ["MCP_RAG_EMBEDDING_DIMENSION"] = "3"
+    os.environ["MCP_RAG_EMBEDDING_TIMEOUT_SECONDS"] = "12"
+    os.environ["MCP_RAG_EMBEDDING_BATCH_SIZE"] = "3"
+
+    provider_a = get_embedding_provider(get_settings())
+    texts = [f"item_{i}" for i in range(7)]
+    vectors = provider_a.embed_texts(texts)
+
+    assert [len(b) for b in batch_inputs] == [3, 3, 1]
+    assert [v[0] for v in vectors] == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    assert captured_timeouts == [12.0, 12.0, 12.0]
+
+    # 3. 修改 timeout 或 batch_size 后不应命中旧缓存实例
+    os.environ["MCP_RAG_EMBEDDING_TIMEOUT_SECONDS"] = "45"
+    os.environ["MCP_RAG_EMBEDDING_BATCH_SIZE"] = "2"
+    provider_b = get_embedding_provider(get_settings())
+    assert provider_b is not provider_a
+
+    batch_inputs.clear()
+    captured_timeouts.clear()
+    vectors_b = provider_b.embed_texts([f"item_{i}" for i in range(5)])
+    assert [len(b) for b in batch_inputs] == [2, 2, 1]
+    assert [v[0] for v in vectors_b] == [0.0, 1.0, 2.0, 3.0, 4.0]
+    assert captured_timeouts == [45.0, 45.0, 45.0]
+
+    # 4. 某批次超时时立即抛出 RuntimeError 而不继续后续批次
+    fail_batches = 0
+
+    def _timeout_on_second(request: httpx.Request) -> httpx.Response:
+        nonlocal fail_batches
+        fail_batches += 1
+        if fail_batches == 2:
+            raise httpx.ReadTimeout("simulated read timeout", request=request)
+        return _handler(request)
+
+    timeout_transport = httpx.MockTransport(_timeout_on_second)
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda *args, **kwargs: _REAL_HTTPX_CLIENT(transport=timeout_transport, **kwargs),
+    )
+    with pytest.raises(RuntimeError, match="超时"):
+        provider_b.embed_texts([f"item_{i}" for i in range(6)])
+    assert fail_batches == 2
+
+
+@pytest.mark.anyio
+async def test_mcp_index_file_and_directory_report_progress(
+    isolated_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2E: FastMCP 边界调用 rag_index_file / rag_index_directory 触发分批进度回调 (Issue #20)。"""
+    from mcp.server.mcpserver import Context
+
+    from mcp_server_rag.config import get_settings
+    from mcp_server_rag.server import create_server
+
+    _patch_httpx_mock(monkeypatch, _make_fixed_dim_handler(4))
+    os.environ["MCP_RAG_EMBEDDING_PROVIDER"] = "ollama"
+    os.environ["MCP_RAG_EMBEDDING_MODEL"] = "qwen3-embedding:0.6b"
+    os.environ["MCP_RAG_EMBEDDING_DIMENSION"] = "4"
+    os.environ["MCP_RAG_EMBEDDING_BATCH_SIZE"] = "2"
+    os.environ["MCP_RAG_CHUNK_SIZE"] = "80"
+    os.environ["MCP_RAG_CHUNK_OVERLAP"] = "0"
+
+    assert rag_create_kb(name="kb_prog")["success"] is True
+
+    docs_dir = Path(isolated_env) / "prog_docs"
+    docs_dir.mkdir()
+    big_md = docs_dir / "big.md"
+    big_md.write_text(
+        "\n\n".join(
+            f"第{i}段内容：这是一段用于触发多分片向量化进度上报的长文本。" * 2 for i in range(6)
+        ),
+        encoding="utf-8",
+    )
+    second_md = docs_dir / "second.md"
+    second_md.write_text("第二个文件正文内容。", encoding="utf-8")
+
+    events_by_ctx: dict[int, list[tuple[float, float | None, str | None]]] = {}
+
+    class _SpyContext(Context):  # type: ignore[type-arg]
+        async def report_progress(
+            self,
+            progress: float,
+            total: float | None = None,
+            message: str | None = None,
+        ) -> None:
+            events_by_ctx.setdefault(id(self), []).append((progress, total, message))
+
+    server = create_server(get_settings())
+    file_ctx = _SpyContext(mcp_server=server, subscriptions=server._subscriptions)
+    await server.call_tool(
+        "rag_index_file",
+        {"kb_name": "kb_prog", "file_path": str(big_md)},
+        context=file_ctx,
+    )
+    # 至少有解析、多个向量分批、入库与完成进度通知，且单调非减
+    file_events = events_by_ctx.get(id(file_ctx), [])
+    assert len(file_events) >= 4
+    progress_vals = [ev[0] for ev in file_events]
+    assert progress_vals == sorted(progress_vals)
+    assert file_events[-1][0] == file_events[-1][1]
+
+    dir_ctx = _SpyContext(mcp_server=server, subscriptions=server._subscriptions)
+    await server.call_tool(
+        "rag_index_directory",
+        {"kb_name": "kb_prog", "dir_path": str(docs_dir)},
+        context=dir_ctx,
+    )
+    dir_events = events_by_ctx.get(id(dir_ctx), [])
+    assert len(dir_events) >= 2
+    assert dir_events[-1][0] == dir_events[-1][1]
+
+
+def test_background_async_ingestion_and_task_status_tool(
+    isolated_env: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 background=True 后台异步摄取与 rag_get_task_status 状态追踪 (Issue #20 Seam B2)。"""
+    import time
+
+    from mcp_server_rag.server import rag_get_task_status
+
+    _patch_httpx_mock(monkeypatch, _make_fixed_dim_handler(4))
+    os.environ["MCP_RAG_EMBEDDING_PROVIDER"] = "ollama"
+    os.environ["MCP_RAG_EMBEDDING_MODEL"] = "qwen3-embedding:0.6b"
+    os.environ["MCP_RAG_EMBEDDING_DIMENSION"] = "4"
+    os.environ["MCP_RAG_EMBEDDING_BATCH_SIZE"] = "2"
+    os.environ["MCP_RAG_CHUNK_SIZE"] = "80"
+    os.environ["MCP_RAG_CHUNK_OVERLAP"] = "0"
+
+    assert rag_create_kb(name="kb_bg")["success"] is True
+
+    docs_dir = Path(isolated_env) / "bg_docs"
+    docs_dir.mkdir()
+    bg_file = docs_dir / "manual.md"
+    bg_file.write_text(
+        "# 异步大文档\n\n"
+        + "\n\n".join(f"第{i}节：后台异步摄取核心链路验证。" * 2 for i in range(4)),
+        encoding="utf-8",
+    )
+
+    # 1. 前置校验失败（文件不存在）在 background=True 时立即同步失败，不生成后台任务
+    bad_bg = rag_index_file(
+        kb_name="kb_bg",
+        file_path=str(docs_dir / "missing.md"),
+        background=True,
+    )
+    assert bad_bg["success"] is False
+    assert "task_id" not in bad_bg
+
+    # 2. 单文件后台异步摄取
+    accepted = rag_index_file(
+        kb_name="kb_bg",
+        file_path=str(bg_file),
+        background=True,
+    )
+    assert accepted["success"] is True
+    assert accepted["status"] == "accepted"
+    task_id = accepted["task_id"]
+    assert isinstance(task_id, str) and task_id
+
+    final_status: dict[str, Any] = {}
+    for _ in range(50):
+        final_status = rag_get_task_status(task_id)
+        if final_status.get("status") in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    assert final_status["success"] is True
+    assert final_status["status"] == "completed"
+    assert final_status["result"]["success"] is True
+    assert final_status["result"]["status"] == "indexed"
+    assert len(rag_search(kb_name="kb_bg", query="后台异步摄取核心链路", top_k=2)) >= 1
+
+    # 3. 目录后台异步摄取
+    extra_file = docs_dir / "extra.md"
+    extra_file.write_text("目录异步摄取补充文档。", encoding="utf-8")
+    dir_accepted = rag_index_directory(
+        kb_name="kb_bg",
+        dir_path=str(docs_dir),
+        background=True,
+    )
+    assert dir_accepted["success"] is True
+    assert dir_accepted["status"] == "accepted"
+    dir_task_id = dir_accepted["task_id"]
+
+    dir_final: dict[str, Any] = {}
+    for _ in range(50):
+        dir_final = rag_get_task_status(dir_task_id)
+        if dir_final.get("status") in {"completed", "failed"}:
+            break
+        time.sleep(0.05)
+
+    assert dir_final["success"] is True
+    assert dir_final["status"] == "completed"
+    assert dir_final["result"]["total_indexed"] == 2
+
+    # 4. 查询不存在的 task_id 返回清晰错误
+    missing_task = rag_get_task_status("nonexistent_task_id")
+    assert missing_task["success"] is False
+    assert "nonexistent_task_id" in missing_task["message"]
+
+    # 5. 目录内所有文件均失败时后台任务状态应标为 failed，且任务上限不淘汰活跃任务
+    from mcp_server_rag.tasks import IngestionTaskManager
+
+    fail_mgr = IngestionTaskManager(max_workers=1, max_tasks=1)
+    gate = __import__("threading").Event()
+    t_active = fail_mgr.submit(
+        task_type="index_file",
+        target="a.md",
+        runner=lambda cb: (gate.wait(2.0), {"success": True})[1],
+    )
+    t_second = fail_mgr.submit(
+        task_type="index_directory",
+        target="bad_dir",
+        runner=lambda cb: {"success": True, "total_indexed": 2, "failed_count": 2},
+    )
+    assert fail_mgr.get_status(t_active["task_id"])["success"] is True
+    gate.set()
+    for _ in range(40):
+        st = fail_mgr.get_status(t_second["task_id"])
+        if st.get("status") in {"completed", "failed"}:
+            break
+        time.sleep(0.02)
+    assert fail_mgr.get_status(t_second["task_id"])["status"] == "failed"

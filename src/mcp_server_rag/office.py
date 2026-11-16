@@ -400,6 +400,8 @@ def _parse_docx_document(
     file_path: Path,
     kb_name: str,
     doc_id: str,
+    *,
+    extract_images: bool = True,
 ) -> ParsedOfficeDocument:
     """解析 Word (.docx) 文档：按阅读流抽取段落、内容控件、表格与内嵌图片并打桩。"""
     docx_mod = _load_python_docx()
@@ -416,6 +418,8 @@ def _parse_docx_document(
         document = docx_mod.Document(fp)
 
         def _extract_rid(r_id: str, alt_hint: str) -> ExtractedImage | None:
+            if not extract_images:
+                return None
             if r_id in rid_cache:
                 return rid_cache[r_id]
             try:
@@ -468,6 +472,8 @@ def _parse_pdf_page(
     valid_images: list[ExtractedImage],
     used_lower_filenames: set[str],
     content_cache: dict[str, ExtractedImage],
+    *,
+    extract_images: bool = True,
 ) -> str | None:
     """提取单个 PDF 页面的正文文本与逐张隔离的合格图片锚点。"""
     try:
@@ -477,41 +483,42 @@ def _parse_pdf_page(
         raw_page_text = ""
 
     page_anchors: list[str] = []
-    try:
-        images_proxy = page.images
-        image_count = len(images_proxy)
-    except Exception as exc:
-        logger.warning("统计 PDF 第 %d 页图片数量失败 (%s): %s", page_idx, file_name, exc)
-        images_proxy = None
-        image_count = 0
-
-    for img_idx in range(image_count):
+    if extract_images:
         try:
-            img_obj = images_proxy[img_idx]
-            raw_bytes = bytes(getattr(img_obj, "data", b"") or b"")
-            raw_name = str(getattr(img_obj, "name", "") or f"img_{img_idx + 1}")
+            images_proxy = page.images
+            image_count = len(images_proxy)
         except Exception as exc:
-            logger.warning(
-                "读取 PDF 第 %d 页第 %d 张图片失败 (%s): %s",
-                page_idx,
-                img_idx + 1,
-                file_name,
-                exc,
-            )
-            continue
+            logger.warning("统计 PDF 第 %d 页图片数量失败 (%s): %s", page_idx, file_name, exc)
+            images_proxy = None
+            image_count = 0
 
-        stem_hint = Path(raw_name.replace("\\", "/")).stem or f"img_{img_idx + 1}"
-        hint = f"page_{page_idx}_{stem_hint}"
-        final_image = _register_unique_image(
-            raw_bytes,
-            filename_hint=hint,
-            alt_hint=f"PDF 第 {page_idx} 页插图",
-            valid_images=valid_images,
-            used_lower_filenames=used_lower_filenames,
-            content_cache=content_cache,
-        )
-        if final_image is not None:
-            page_anchors.append(_format_markdown_anchor(kb_name, doc_key, final_image))
+        for img_idx in range(image_count):
+            try:
+                img_obj = images_proxy[img_idx]
+                raw_bytes = bytes(getattr(img_obj, "data", b"") or b"")
+                raw_name = str(getattr(img_obj, "name", "") or f"img_{img_idx + 1}")
+            except Exception as exc:
+                logger.warning(
+                    "读取 PDF 第 %d 页第 %d 张图片失败 (%s): %s",
+                    page_idx,
+                    img_idx + 1,
+                    file_name,
+                    exc,
+                )
+                continue
+
+            stem_hint = Path(raw_name.replace("\\", "/")).stem or f"img_{img_idx + 1}"
+            hint = f"page_{page_idx}_{stem_hint}"
+            final_image = _register_unique_image(
+                raw_bytes,
+                filename_hint=hint,
+                alt_hint=f"PDF 第 {page_idx} 页插图",
+                valid_images=valid_images,
+                used_lower_filenames=used_lower_filenames,
+                content_cache=content_cache,
+            )
+            if final_image is not None:
+                page_anchors.append(_format_markdown_anchor(kb_name, doc_key, final_image))
 
     if not raw_page_text and not page_anchors:
         return None
@@ -527,6 +534,8 @@ def _parse_pdf_document(
     file_path: Path,
     kb_name: str,
     doc_id: str,
+    *,
+    extract_images: bool = True,
 ) -> ParsedOfficeDocument:
     """解析 PDF 文档：逐页提取文本与内嵌图片，经过噪点门禁后按页打入 Markdown 锚点。"""
     pypdf_mod = _load_pypdf()
@@ -561,6 +570,7 @@ def _parse_pdf_document(
                 valid_images=valid_images,
                 used_lower_filenames=used_lower_filenames,
                 content_cache=content_cache,
+                extract_images=extract_images,
             )
             if page_block:
                 blocks.append(page_block)
@@ -575,6 +585,8 @@ def parse_office_document(
     file_path: Path,
     kb_name: str,
     doc_id: str,
+    *,
+    extract_images: bool = True,
 ) -> ParsedOfficeDocument:
     """根据扩展名解析 ``.pdf`` 或 ``.docx`` 文档并返回打桩后的 Markdown 与有效图片资产。
 
@@ -582,6 +594,7 @@ def parse_office_document(
         file_path: 待解析的本地二进制文档路径。
         kb_name: 目标知识库名称，用于生成 ``rag://assets/{kb_name}/{doc_key}/{filename}`` 锚点。
         doc_id: 文档唯一标识符，用于生成跨平台安全的资产目录键。
+        extract_images: 是否提取并打桩文档内嵌图片，默认 ``True``。
 
     Returns:
         包含归一化 Markdown 正文与通过噪点门禁的有效图片列表的 ``ParsedOfficeDocument``。
@@ -593,7 +606,17 @@ def parse_office_document(
     """
     ext = file_path.suffix.lower()
     if ext == ".pdf":
-        return _parse_pdf_document(file_path, kb_name=kb_name, doc_id=doc_id)
+        return _parse_pdf_document(
+            file_path,
+            kb_name=kb_name,
+            doc_id=doc_id,
+            extract_images=extract_images,
+        )
     if ext == ".docx":
-        return _parse_docx_document(file_path, kb_name=kb_name, doc_id=doc_id)
+        return _parse_docx_document(
+            file_path,
+            kb_name=kb_name,
+            doc_id=doc_id,
+            extract_images=extract_images,
+        )
     raise ValueError(f"不支持的二进制文档格式: {file_path.suffix}")

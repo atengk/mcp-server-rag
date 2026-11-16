@@ -93,7 +93,7 @@ async def test_read_only_guard_physically_hides_write_tools() -> None:
 
 @pytest.mark.anyio
 async def test_writable_mode_registers_all_tools() -> None:
-    """验证当 MCP_RAG_READ_ONLY=false 时，注册全部 13 个工具。"""
+    """验证当 MCP_RAG_READ_ONLY=false 时，注册全部 14 个工具。"""
     os.environ["MCP_RAG_READ_ONLY"] = "false"
     settings = get_settings()
     assert settings.read_only is False
@@ -114,6 +114,7 @@ async def test_writable_mode_registers_all_tools() -> None:
         "rag_index_file",
         "rag_index_directory",
         "rag_index_url",
+        "rag_get_task_status",
         "rag_search",
         "rag_query_with_context",
     }

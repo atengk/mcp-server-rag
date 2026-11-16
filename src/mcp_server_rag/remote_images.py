@@ -167,7 +167,7 @@ def download_safe_remote_image(
     *,
     filename_hint: str = "",
     alt: str = "",
-    timeout_seconds: int = 15,
+    timeout_seconds: int = 8,
     max_bytes: int = 10 * 1024 * 1024,
     max_redirects: int = 5,
     transport: httpx.BaseTransport | None = None,
@@ -179,7 +179,7 @@ def download_safe_remote_image(
         url: 远程图片 URL。
         filename_hint: 可选图片文件名提示，省略时从最终 URL 路径提取。
         alt: 图片替代描述文本。
-        timeout_seconds: 单跳 HTTP 连接/读取超时秒数，默认 ``15``。
+        timeout_seconds: 单跳 HTTP 读取超时秒数，默认 ``8``（连接超时封顶 ``5`` 秒）。
         max_bytes: 允许下载的最大响应体字节数，默认 ``10MB``。
         max_redirects: 最大允许 HTTP 重定向跳转次数，默认 ``5``。
         transport: 可选注入的 ``httpx.BaseTransport``（如测试用 ``MockTransport``）。
@@ -193,11 +193,13 @@ def download_safe_remote_image(
         SSRFBlockedError: 当初始 URL 或任意重定向跳转目标违反 SSRF 安全策略时直接抛出。
     """
     current_url = validate_remote_image_url(url, dns_resolver=dns_resolver)
+    connect_timeout = min(5.0, float(timeout_seconds))
+    read_timeout = float(timeout_seconds)
     timeout = httpx.Timeout(
-        connect=float(timeout_seconds),
-        read=float(timeout_seconds),
-        write=float(timeout_seconds),
-        pool=float(timeout_seconds),
+        connect=connect_timeout,
+        read=read_timeout,
+        write=read_timeout,
+        pool=connect_timeout,
     )
     client_kwargs: dict[str, object] = {
         "timeout": timeout,
