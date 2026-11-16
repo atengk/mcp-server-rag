@@ -686,8 +686,7 @@ def test_database_url_special_password_reaches_postgres_and_mysql_drivers(
         args, kwargs = captured_calls[0]
         if backend == "postgresql":
             assert (
-                args[0]
-                == "postgresql://rag_admin:Admin%40123%23@db.example.com:5432/rag_metadata"
+                args[0] == "postgresql://rag_admin:Admin%40123%23@db.example.com:5432/rag_metadata"
             )
         else:
             assert kwargs["host"] == "db.example.com"

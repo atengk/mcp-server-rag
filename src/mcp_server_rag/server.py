@@ -546,9 +546,7 @@ def _probe_storage_health(settings: Settings) -> dict[str, Any]:
     if settings.storage_type != "s3":
         return {
             "storage_status": "error",
-            "storage_error": (
-                f"不支持的对象存储类型 '{settings.storage_type}'，可选值: local, s3"
-            ),
+            "storage_error": (f"不支持的对象存储类型 '{settings.storage_type}'，可选值: local, s3"),
         }
 
     try:

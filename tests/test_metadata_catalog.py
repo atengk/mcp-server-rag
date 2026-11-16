@@ -483,8 +483,7 @@ def test_database_url_userinfo_special_chars_and_invalid_dsn_guidance() -> None:
     s_complex = Settings(
         metadata_store="mysql",
         database_url=(
-            "mysql://rag@corp:P@ss:w#rd?1 2"
-            "@mysql.internal.local:3307/team_rag?charset=utf8mb4"
+            "mysql://rag@corp:P@ss:w#rd?1 2@mysql.internal.local:3307/team_rag?charset=utf8mb4"
         ),
     )
     assert s_complex.resolved_database_url() == (
@@ -510,13 +509,11 @@ def test_database_url_userinfo_special_chars_and_invalid_dsn_guidance() -> None:
     s_query_at = Settings(
         metadata_store="postgresql",
         database_url=(
-            "postgresql://postgres:Admin@123@db.example.com:5432/rag_metadata"
-            "?email=ops@example.com"
+            "postgresql://postgres:Admin@123@db.example.com:5432/rag_metadata?email=ops@example.com"
         ),
     )
     assert s_query_at.resolved_database_url() == (
-        "postgresql://postgres:Admin%40123@db.example.com:5432/rag_metadata"
-        "?email=ops@example.com"
+        "postgresql://postgres:Admin%40123@db.example.com:5432/rag_metadata?email=ops@example.com"
     )
 
     # 6. 非法 DSN（如缺少主机名或非 IPv6 主机含多个冒号）抛出带配置建议的 ValueError
