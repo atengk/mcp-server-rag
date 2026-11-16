@@ -185,12 +185,35 @@ uv run mcp-server-rag
 
 ### 1. 标准默认接入配置 (`uvx` 免安装，纯本地零配置)
 
+> 💡 **提示**：在包尚未发布至 PyPI 或需直接运行本地克隆源码时，执行 `uvx` 可能报错 `No solution found`；请改用下方「[1.1 本地仓库源码直连配置](#11-本地仓库源码直连配置-uv---directory)」方式启动。
+
 ```json
 {
   "mcpServers": {
     "rag": {
       "command": "uvx",
       "args": ["atengk-mcp-server-rag"]
+    }
+  }
+}
+```
+
+#### 1.1 本地仓库源码直连配置 (`uv --directory`)
+
+先在仓库目录执行一次 `uv sync --all-extras` 完成依赖安装，再在 MCP 客户端配置中直接指向本地仓库目录：
+
+```json
+{
+  "mcpServers": {
+    "rag": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/mcp-server-rag",
+        "run",
+        "--no-sync",
+        "mcp-server-rag"
+      ]
     }
   }
 }
@@ -231,20 +254,26 @@ uv run mcp-server-rag
       "env": {
         "MCP_RAG_VECTOR_STORE": "milvus",
         "MCP_RAG_MILVUS_URI": "http://10.0.0.10:19530",
-        "MCP_RAG_MILVUS_TOKEN": "root:Milvus2026",
+        "MCP_RAG_MILVUS_TOKEN": "YOUR_MILVUS_TOKEN",
         "MCP_RAG_METADATA_STORE": "postgresql",
-        "MCP_RAG_DATABASE_URL": "postgresql://rag_user:Secret2026@10.0.0.11:5432/rag_metadata",
+        "MCP_RAG_DATABASE_URL": "postgresql://rag_user:YOUR_DB_PASSWORD@10.0.0.11:5432/rag_metadata",
         "MCP_RAG_STORAGE_TYPE": "s3",
         "MCP_RAG_S3_BUCKET": "team-rag-assets",
         "MCP_RAG_S3_ENDPOINT": "https://minio.corp.internal:9000",
-        "MCP_RAG_S3_ACCESS_KEY": "minioadmin",
-        "MCP_RAG_S3_SECRET_KEY": "miniopassword",
+        "MCP_RAG_S3_ACCESS_KEY": "YOUR_S3_ACCESS_KEY",
+        "MCP_RAG_S3_SECRET_KEY": "YOUR_S3_SECRET_KEY",
         "MCP_RAG_ARCHIVE_REMOTE_IMAGES": "true"
       }
     }
   }
 }
 ```
+
+> ⚠️ **企业级中间件前置准备与避坑提示**：
+> - **PostgreSQL / MySQL 预建库**：需预先创建目标数据库（如 `rag_metadata`），表结构与索引由服务端在首次连接时自动初始化。
+> - **DSN 特殊字符处理**：`MCP_RAG_DATABASE_URL` 已支持自动转义用户名与密码中的 `@`、`:`、`#`、`?` 等特殊字符；若连接串较复杂，推荐改用 `MCP_RAG_DB_HOST` / `MCP_RAG_DB_PORT` / `MCP_RAG_DB_USER` / `MCP_RAG_DB_PASSWORD` / `MCP_RAG_DB_NAME` 拆分环境变量。
+> - **S3 / MinIO 预建桶要求**：`MCP_RAG_STORAGE_TYPE=s3` 默认要求预先手动创建 `MCP_RAG_S3_BUCKET` 存储桶；若需在桶不存在时由服务端自动创建，请显式设置 `MCP_RAG_S3_AUTO_CREATE_BUCKET=true`，并可通过 `rag_doctor` 验证存储桶连通性。
+> - **Milvus 按维度隔离集合**：默认按 `{MCP_RAG_MILVUS_COLLECTION_PREFIX}_d{dimension}`（如 `mcp_rag_chunks_d512`、`mcp_rag_chunks_d1024`）自动分集合，避免多维度模型切换建库冲突，并自动平滑兼容历史单集合 `mcp_rag_chunks`；如需固定单个集合名，可配置 `MCP_RAG_MILVUS_COLLECTION`。
 
 ### 4. 只读安全模式 (生产查阅与防误删场景)
 
@@ -268,13 +297,13 @@ uv run mcp-server-rag
 
 ## 🧰 FastMCP 工具与资源契约规范 (Tools & Resources)
 
-### 一、 FastMCP 核心工具矩阵 (13 Tools)
+### 一、 FastMCP 核心工具矩阵 (14 Tools)
 
 #### 1. 知识库生命周期管理 (Knowledge Base Lifecycle)
 
 | 工具名称 | 读写属性 | 参数与类型 | 核心功能说明 |
 | :--- | :--- | :--- | :--- |
-| **`rag_create_kb`** | 写操作 | `name: str`<br>`description: str = ""` | 创建新的知识库逻辑命名空间并在底层向量库与元数据库初始化。 |
+| **`rag_create_kb`** | 写操作 | `name: str`<br>`description: str = ""`<br>`owner: str = "default"`<br>`visibility: str = "public"` | 创建新的知识库逻辑命名空间并在底层向量库与元数据库初始化（含维度一致性校验）。 |
 | **`rag_list_kbs`** | 只读 | _(无入参)_ | 枚举所有知识库，包含各自的文档总数、切片统计、创建与更新时间。 |
 | **`rag_clear_kb`** | 写操作 | `name: str` | 原子清空指定知识库下的所有文档、切片与关联图片资产，保留基础配置。 |
 | **`rag_delete_kb`** | 写操作 | `name: str` | 物理销毁指定知识库及其关联的全部元数据、倒排索引、向量数据与物理资产。 |
@@ -283,10 +312,11 @@ uv run mcp-server-rag
 
 | 工具名称 | 读写属性 | 参数与类型 | 核心功能说明 |
 | :--- | :--- | :--- | :--- |
-| **`rag_index_text`** | 写操作 | `kb_name: str`<br>`text: str`<br>`title: str`<br>`metadata: dict = None` | 对纯文本内容进行语法切片、向量嵌入与入库；支持基于内容指纹幂等去重。 |
-| **`rag_index_file`** | 写操作 | `kb_name: str`<br>`file_path: str`<br>`metadata: dict = None` | 自动识别格式（Markdown、源码、数据、Office、PDF），执行结构感知切片与增量索引。 |
-| **`rag_index_directory`** | 写操作 | `kb_name: str`<br>`dir_path: str`<br>`glob_pattern: str = "**/*"`<br>`max_files: int = 200`<br>`recursive: bool = True` | 批量扫描并摄取本地目录文档；内置格式过滤、忽略列表与 `max_files` 防超时截断。 |
-| **`rag_index_url`** | 写操作 | `kb_name: str`<br>`url: str`<br>`metadata: dict = None` | 抓取网页并清洗 HTML 视觉噪点，提取正文、处理相对外链图片并完成向量化。 |
+| **`rag_index_text`** | 写操作 | `kb_name: str`<br>`text: str`<br>`title: str`<br>`metadata: dict = None`<br>`archive_remote_images: bool \| None = None`<br>`extract_images: bool = True` | 对纯文本内容进行语法切片、向量嵌入与入库；支持基于内容指纹幂等去重与图片资产控制。 |
+| **`rag_index_file`** | 写操作 | `kb_name: str`<br>`file_path: str`<br>`metadata: dict = None`<br>`archive_remote_images: bool \| None = None`<br>`extract_images: bool = True`<br>`background: bool = False` | 自动识别格式（Markdown、源码、数据、Office、PDF），支持跳过图片加速摄取、进度汇报与后台异步任务模式。 |
+| **`rag_index_directory`** | 写操作 | `kb_name: str`<br>`dir_path: str`<br>`glob_pattern: str = "**/*"`<br>`max_files: int = 200`<br>`recursive: bool = True`<br>`archive_remote_images: bool \| None = None`<br>`extract_images: bool = True`<br>`background: bool = False` | 批量扫描并摄取本地目录文档；内置忽略列表、`max_files` 防超时截断及 `background=True` 异步后台任务支持。 |
+| **`rag_index_url`** | 写操作 | `kb_name: str`<br>`url: str`<br>`metadata: dict = None`<br>`archive_remote_images: bool \| None = None`<br>`extract_images: bool = True` | 抓取网页并清洗 HTML 视觉噪点，提取正文、处理相对外链图片并完成向量化。 |
+| **`rag_get_task_status`** | 查询 _(读写模式可用)_ | `task_id: str` | 查询由 `rag_index_file(..., background=True)` 或 `rag_index_directory(..., background=True)` 返回的后台任务执行进度、状态与最终结果。 |
 | **`rag_delete_document`** | 写操作 | `kb_name: str`<br>`doc_id: str` | 按文档 ID 精确级联删除单个文档、所有切片以及登记的物理图片资产。 |
 
 #### 3. 混合检索与上下文增强 (Hybrid Search & Context Augmentation)
@@ -300,7 +330,7 @@ uv run mcp-server-rag
 
 | 工具名称 | 读写属性 | 参数与类型 | 核心功能说明 |
 | :--- | :--- | :--- | :--- |
-| **`rag_doctor`** | 只读 | _(无入参)_ | 全维系统健康自检：检查 SQLite/PG/MySQL 连通性、向量库连通性、磁盘占用、模型维度、Reranker 状态、存储模式与只读状态。 |
+| **`rag_doctor`** | 只读 | _(无入参)_ | 全维系统健康自检：检查 SQLite/PG/MySQL 连通性、向量库连通性与 Milvus 集合维度一致性、S3 存储桶可用性、磁盘占用、模型维度、Reranker 状态与只读状态。 |
 | **`health_check`** | 只读 | _(无入参)_ | 检查 RAG MCP 服务的在线状态、服务标识与版本号。 |
 
 ---
@@ -366,21 +396,24 @@ Agent 调用 -> rag_search(kb_name="project_docs", query="图片资产网关与�
 | **`MCP_RAG_VECTOR_STORE`** | string | `chromadb` | 向量存储引擎类型，支持 `chromadb`（默认本地）与 `milvus`（远程分布式集群）。 |
 | **`MCP_RAG_MILVUS_URI`** | string | `http://localhost:19530` | 外部 Milvus 集群接入服务地址（仅在 `VECTOR_STORE=milvus` 时生效）。 |
 | **`MCP_RAG_MILVUS_TOKEN`** | string | `""` | 外部 Milvus 集群认证鉴权 Token 或 `username:password`。 |
+| **`MCP_RAG_MILVUS_COLLECTION`** | string | `""` | 显式固定 Milvus 物理集合名（如 `mcp_rag_chunks`）；留空时默认启用按维度自动分集合隔离策略。 |
+| **`MCP_RAG_MILVUS_COLLECTION_PREFIX`** | string | `mcp_rag_chunks` | 按维度隔离时的 Milvus 集合前缀（生成 `{prefix}_d{dimension}` 集合，如 `mcp_rag_chunks_d512`）。 |
 | **元数据存储配置** | | | |
 | **`MCP_RAG_METADATA_STORE`** | string | `sqlite` | 元数据与原生 FTS 存储驱动，支持 `sqlite`、`postgresql`、`mysql`。 |
-| **`MCP_RAG_DATABASE_URL`** | string | `""` | 关系型数据库连接 DSN（如 `postgresql://user:pass@host:5432/db`）；优先级高于拆分变量。 |
+| **`MCP_RAG_DATABASE_URL`** | string | `""` | 关系型数据库连接 DSN（如 `postgresql://user:pass@host:5432/db`）；支持密码特殊字符自动编码，优先级高于拆分变量。 |
 | **`MCP_RAG_DB_HOST`** | string | `""` | 数据库主机名/IP（拆分配置项）。 |
 | **`MCP_RAG_DB_PORT`** | int | `None` | 数据库端口（缺省自动适配各数据库默认端口）。 |
 | **`MCP_RAG_DB_USER`** | string | `""` | 数据库认证用户名。 |
 | **`MCP_RAG_DB_PASSWORD`** | string | `""` | 数据库认证密码（自动执行 URL 编码）。 |
 | **`MCP_RAG_DB_NAME`** | string | `""` | 目标数据库名。 |
 | **向量嵌入配置** | | | |
-| **`MCP_RAG_EMBEDDING_PROVIDER`** | string | `fastembed` | 嵌入引擎类型，支持 `fastembed`、`openai`、`qwen`、`ollama`、`deepseek`。 |
+| **`MCP_RAG_EMBEDDING_PROVIDER`** | string | `fastembed` | 嵌入引擎类型，支持 `fastembed`、`openai`、`qwen`、`ollama`、`deepseek`、`siliconflow`、`openai-compatible`。 |
 | **`MCP_RAG_EMBEDDING_MODEL`** | string | `BAAI/bge-small-zh-v1.5` | 嵌入模型标识，各 Provider 具备专属默认推荐模型。 |
 | **`MCP_RAG_EMBEDDING_BASE_URL`** | string | `""` | 外部 Embedding 服务基准 URL（Ollama / Qwen / OpenAI 等各具备预设默认值）。 |
 | **`MCP_RAG_EMBEDDING_API_KEY`** | string | `""` | 外部 Embedding 服务鉴权 API Key（Bearer 鉴权）。 |
 | **`MCP_RAG_EMBEDDING_DIMENSION`** | int | `None` | 显式指定向量维度（支持 OpenAI / Qwen 等 MRL 维度裁剪；缺省时自动发起探针探测）。 |
-| **`MCP_RAG_EMBEDDING_TIMEOUT_SECONDS`** | int | `30` | 外部嵌入服务调用超时秒数（下限 `min_val=1`）。 |
+| **`MCP_RAG_EMBEDDING_TIMEOUT_SECONDS`** | int | `30` | 外部嵌入服务单次 HTTP 请求超时秒数（已接入 OpenAI 兼容驱动，下限 `min_val=1`）。 |
+| **`MCP_RAG_EMBEDDING_BATCH_SIZE`** | int | `32` | 切片向量化单批请求最大条数，超长文档自动按此分片并发进度汇报（下限 `min_val=1`）。 |
 | **二次重排 (Reranker) 配置** | | | |
 | **`MCP_RAG_RERANK_ENABLED`** | bool | `false` | 二次重排全局开关；设为 `false` 时完全跳过 Reranker，零额外计算开销与零模型加载。 |
 | **`MCP_RAG_RERANK_PROVIDER`** | string | `fastembed` | 重排驱动模式，支持 `fastembed`（本地 CPU ONNX）与 `api`（云端 HTTP API）。 |
@@ -390,7 +423,7 @@ Agent 调用 -> rag_search(kb_name="project_docs", query="图片资产网关与�
 | **`MCP_RAG_RERANK_TIMEOUT_SECONDS`** | int | `30` | 云端重排 HTTP 请求超时秒数。 |
 | **图片资产与对象存储配置** | | | |
 | **`MCP_RAG_STORAGE_TYPE`** | string | `local` | 图片资产存储类型，支持 `local`（本地磁盘）与 `s3`（AWS S3 / MinIO）。 |
-| **`MCP_RAG_S3_BUCKET`** | string | `""` | S3 存储桶名称（`storage_type=s3` 时必填）。 |
+| **`MCP_RAG_S3_BUCKET`** | string | `""` | S3 存储桶名称（`storage_type=s3` 时必填，默认需预先创建）。 |
 | **`MCP_RAG_S3_ENDPOINT`** | string | `""` | S3 兼容服务端点（MinIO 如 `https://minio.example.com:9000`）。 |
 | **`MCP_RAG_S3_REGION`** | string | `us-east-1` | S3 存储区域。 |
 | **`MCP_RAG_S3_ACCESS_KEY`** | string | `""` | S3 Access Key ID。 |
@@ -398,9 +431,13 @@ Agent 调用 -> rag_search(kb_name="project_docs", query="图片资产网关与�
 | **`MCP_RAG_S3_PREFIX`** | string | `assets` | S3 对象存储根前缀目录。 |
 | **`MCP_RAG_S3_PUBLIC_BASE_URL`** | string | `""` | S3 资产对外公共 HTTPS 直链基准域名（配置后切片内图片自动转写为此直链）。 |
 | **`MCP_RAG_S3_TIMEOUT_SECONDS`** | int | `30` | S3 连接与传输超时秒数。 |
+| **`MCP_RAG_S3_AUTO_CREATE_BUCKET`** | bool | `false` | S3 桶不存在时是否由客户端尝试自动创建（默认 `false`，要求运维预建桶）。 |
 | **`MCP_RAG_ARCHIVE_REMOTE_IMAGES`** | bool | `false` | 远程图片外链自动归档开关（设为 `true` 时通过 SSRF 防御沙箱抓取外链并归档至存储桶）。 |
-| **`MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS`** | int | `15` | 抓取外链单跳 HTTP 超时秒数。 |
+| **`MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS`** | int | `8` | 抓取外链图片单次 HTTP 超时秒数（默认 `8`，下限 `min_val=1`）。 |
 | **`MCP_RAG_REMOTE_IMAGE_MAX_BYTES`** | int | `10485760` (10MB) | 抓取或提取图片最大允许字节大小（下限 `min_val=1024`）。 |
+| **`MCP_RAG_REMOTE_IMAGE_CONCURRENCY`** | int | `4` | 并发抓取远程外链图片的线程池最大并发数（下限 `min_val=1`）。 |
+| **`MCP_RAG_REMOTE_IMAGE_SKIP_DOMAINS`** | string (CSV) | `img.shields.io,badgen.net,forthebadge.com` | 跳过归档的远程图片域名清单（逗号分隔，显式设为空串可清空默认跳过列表）。 |
+| **`MCP_RAG_REMOTE_IMAGE_SKIP_EXTENSIONS`** | string (CSV) | `.svg` | 跳过归档的远程图片后缀清单（逗号分隔，显式设为空串可清空默认跳过列表）。 |
 
 ---
 
@@ -431,7 +468,7 @@ uv run ruff format --check .
 # 3. 严格类型检查 (Python 3.10+ Strict Mypy)
 uv run mypy src/mcp_server_rag
 
-# 4. 全量端到端测试套件执行 (110 / 110 项用例 100% 全绿)
+# 4. 全量端到端测试套件执行 (100% 全绿通过)
 uv run pytest -v
 ```
 
