@@ -21,6 +21,7 @@ import sys
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from PIL import Image
@@ -892,3 +893,168 @@ def test_pdf_fault_isolation_dedup_encryption_scan_and_rollback(
     retry_res = rag_index_file(kb_name="pdf_adv_kb", file_path=str(rollback_pdf))
     assert retry_res["success"] is True
     assert retry_res["status"] == "indexed"
+
+
+def test_pdf_caption_alt_extraction_and_inline_anchor_placement(
+    isolated_office_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证 PDF 页内图注 Alt 语义提取、噪点过滤不错位与就地锚点排版 (Issue #23 Seam A)。"""
+    pypdf_mod = pytest.importorskip("pypdf")
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    from mcp_server_rag.office import parse_office_document
+
+    # 1. 构造真实多行英文 PDF（含 Figure 2.1 图题，无 monkeypatch）
+    eng_pdf = isolated_office_env / "english_captions.pdf"
+    chart_eng = _make_png_bytes(220, 180, noisy=True)
+    writer = pypdf_mod.PdfWriter()
+    t_writer = pypdf_mod.PdfWriter()
+    page = t_writer.add_blank_page(width=595, height=842)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    font_ref = t_writer._add_object(font)
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(
+        b"BT /F1 12 Tf 72 720 Td "
+        b"(Architecture Chapter) Tj 0 -20 Td "
+        b"(Figure 2.1: Milvus Deployment Topology) Tj 0 -20 Td "
+        b"(Trailing narrative paragraph.) Tj ET"
+    )
+    page[NameObject("/Contents")] = t_writer._add_object(stream)
+    t_buf = io.BytesIO()
+    t_writer.write(t_buf)
+    t_buf.seek(0)
+    out_page = writer.add_page(pypdf_mod.PdfReader(t_buf).pages[0])
+    with Image.open(io.BytesIO(chart_eng)) as pil_img:
+        ibuf = io.BytesIO()
+        pil_img.convert("RGB").save(ibuf, format="PDF")
+        ibuf.seek(0)
+        out_page.merge_page(pypdf_mod.PdfReader(ibuf).pages[0])
+    with eng_pdf.open("wb") as fp:
+        writer.write(fp)
+
+    parsed_eng = parse_office_document(eng_pdf, kb_name="kb_cap", doc_id="doc_eng")
+    assert len(parsed_eng.images) == 1
+    assert parsed_eng.images[0].alt == "Figure 2.1: Milvus Deployment Topology"
+    fig_pos = parsed_eng.markdown_text.index("Figure 2.1: Milvus Deployment Topology")
+    anchor_pos = parsed_eng.markdown_text.index("![Figure 2.1: Milvus Deployment Topology]")
+    trailing_pos = parsed_eng.markdown_text.index("Trailing narrative paragraph.")
+    assert fig_pos < anchor_pos < trailing_pos
+
+    # 2. 中文多图题 + 噪点图标混排 + 无图题页摘要回退 + 纯图扫描页保底
+    cn_pdf = isolated_office_env / "chinese_captions.pdf"
+    tiny_noise = _make_png_bytes(48, 48, noisy=True)
+    chart_a = _make_png_bytes(220, 200, noisy=True)
+    chart_b = _make_png_bytes(240, 190, noisy=True)
+    chart_c = _make_png_bytes(210, 210, noisy=True)
+    chart_scan = _make_png_bytes(200, 200, noisy=True)
+
+    _build_synthetic_pdf(
+        cn_pdf,
+        pages=[
+            ("p1", [tiny_noise, chart_a, chart_b]),
+            ("p2", [chart_c]),
+            ("", [chart_scan]),
+        ],
+    )
+
+    page_texts = [
+        (
+            "系统设计与架构分析\n"
+            "图 3-1 中展示了传统架构。\n"
+            "图100次压测结果如下。\n"
+            "图 3-2 系统用例图\n"
+            "图 3-3 订单状态流转时序图\n"
+            "后续补充说明段落。"
+        ),
+        "分布式缓存架构概览\n本页讨论一致性哈希与分片策略。",
+        "",
+    ]
+    orig_reader = pypdf_mod.PdfReader
+
+    class _TextInjectedReader(orig_reader):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            for idx, txt in enumerate(page_texts):
+                if idx < len(self.pages):
+                    p = self.pages[idx]
+                    monkeypatch.setattr(p, "extract_text", lambda _t=txt: _t)
+
+    monkeypatch.setattr(pypdf_mod, "PdfReader", _TextInjectedReader)
+    parsed_cn = parse_office_document(cn_pdf, kb_name="kb_cap", doc_id="doc_cn")
+    monkeypatch.undo()
+
+    assert len(parsed_cn.images) == 4
+    # 噪点图被过滤后，两张合格图严格对应第 1、2 个中文图题，不发生错位
+    assert parsed_cn.images[0].alt == "图 3-2 系统用例图"
+    assert parsed_cn.images[1].alt == "图 3-3 订单状态流转时序图"
+    # 无显式图题的文本页回退为包含页首摘要的描述
+    assert "分布式缓存架构概览" in parsed_cn.images[2].alt
+    # 纯图扫描页保留默认描述
+    assert parsed_cn.images[3].alt == "PDF 第 3 页插图"
+
+    # 就地锚点排版：图 3-2 锚点位于 图 3-3 与 后续补充说明段落 之前
+    idx_cap1 = parsed_cn.markdown_text.index("图 3-2 系统用例图")
+    idx_anc1 = parsed_cn.markdown_text.index("![图 3-2 系统用例图]")
+    idx_cap2 = parsed_cn.markdown_text.index("图 3-3 订单状态流转时序图")
+    idx_anc2 = parsed_cn.markdown_text.index("![图 3-3 订单状态流转时序图]")
+    idx_tail = parsed_cn.markdown_text.index("后续补充说明段落。")
+    assert idx_cap1 < idx_anc1 < idx_cap2 < idx_anc2 < idx_tail
+
+
+def test_pdf_long_page_split_direct_image_recall_without_expand_context(
+    isolated_office_env: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2E: 单页长正文切片后，按图注关键词直接召回含图切片（无需 expand_context）。"""
+    pypdf_mod = pytest.importorskip("pypdf")
+
+    os.environ["MCP_RAG_CHUNK_SIZE"] = "120"
+    os.environ["MCP_RAG_CHUNK_OVERLAP"] = "15"
+    assert rag_create_kb(name="pdf_recall_kb")["success"] is True
+
+    long_pdf = isolated_office_env / "textbook_chapter.pdf"
+    use_case_chart = _make_png_bytes(240, 200, noisy=True)
+    _build_synthetic_pdf(long_pdf, pages=[("long_textbook", [use_case_chart])])
+
+    long_page_text = (
+        "第一章 需求建模基础\n"
+        + ("背景介绍：软件工程需求分析阶段需要明确系统边界与参与者交互职责。" * 3)
+        + "\n图 1-1 订单用例图\n"
+        + ("总结部分：系统架构师应基于业务闭环校验各模块职责划分与异常补偿机制。" * 3)
+    )
+    orig_reader = pypdf_mod.PdfReader
+
+    class _LongPageReader(orig_reader):  # type: ignore[misc, valid-type]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            p = self.pages[0]
+            monkeypatch.setattr(p, "extract_text", lambda: long_page_text)
+
+    monkeypatch.setattr(pypdf_mod, "PdfReader", _LongPageReader)
+    idx_res = rag_index_file(kb_name="pdf_recall_kb", file_path=str(long_pdf))
+    monkeypatch.undo()
+
+    assert idx_res["success"] is True
+    assert idx_res["chunk_count"] >= 3
+
+    # 不依赖 expand_context，直接以图注语义词检索应直接命中包含图片资产的切片
+    hits = rag_search(
+        kb_name="pdf_recall_kb",
+        query="订单用例图",
+        top_k=1,
+        expand_context=0,
+    )
+    assert len(hits) == 1
+    assert "订单用例图" in hits[0]["text"]
+    assert len(hits[0]["metadata"]["images"]) == 1
+    assert hits[0]["metadata"]["images"][0].startswith("rag://assets/pdf_recall_kb/")

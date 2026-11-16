@@ -29,6 +29,35 @@ logger = logging.getLogger(__name__)
 
 OFFICE_EXTENSIONS: frozenset[str] = frozenset({".pdf", ".docx"})
 DEFAULT_DOCX_IMAGE_ALT: str = "Word 文档插图"
+_PDF_CAPTION_MAX_LEN: int = 120
+_PDF_CAPTION_RE = re.compile(
+    r"^\s*(?:"
+    r"图\s*\d+[.\-]\d+(?:\s*[:：.]?\s*|\s+)[^\n]+"
+    r"|图\s*\d+(?:\s*[:：.]\s*|\s+)[^\n]+"
+    r"|(?:Figure|Fig\.?)\s*\d+(?:[.\-]\d+)*(?:\s*[:：.]\s*|\s+)[^\n]+"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_PDF_NARRATIVE_CAPTION_RE = re.compile(
+    r"^(?:"
+    r"图\s*\d+(?:[.\-]\d+)*\s*(?:所示|中|可见|表明|显示)"
+    r"|(?:Figure|Fig\.?)\s*\d+(?:[.\-]\d+)*\s*(?:shows|illustrates|depicts)\b"
+    r")",
+    re.IGNORECASE,
+)
+_PDF_PAGE_NUM_RE = re.compile(
+    r"^\s*(?:-?\s*\d+\s*-?|第\s*\d+\s*页|page\s*\d+(?:\s*/\s*\d+)?)\s*$",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class _PdfCaption:
+    """单页 PDF 内识别到的图题行位置与清洗后文本。"""
+
+    line_idx: int
+    text: str
+
 
 _REL_EMBED_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
 _REL_ID_ATTR = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
@@ -463,6 +492,65 @@ def _parse_docx_document(
     )
 
 
+def _extract_pdf_page_captions(raw_page_text: str) -> list[_PdfCaption]:
+    """从单页 PDF 文本中提取按出现顺序排列的显式图题行列表。"""
+    if not raw_page_text:
+        return []
+    captions: list[_PdfCaption] = []
+    for line_idx, raw_line in enumerate(raw_page_text.splitlines()):
+        clean = re.sub(r"\s+", " ", raw_line).strip()
+        if not clean:
+            continue
+        if not _PDF_CAPTION_RE.match(clean):
+            continue
+        if _PDF_NARRATIVE_CAPTION_RE.match(clean):
+            continue
+        if len(clean) > _PDF_CAPTION_MAX_LEN:
+            clean = clean[:_PDF_CAPTION_MAX_LEN].rstrip() + "..."
+        captions.append(_PdfCaption(line_idx=line_idx, text=clean))
+    return captions
+
+
+def _extract_pdf_page_summary(raw_page_text: str, max_len: int = 40) -> str:
+    """提取无显式图题 PDF 页面的首行标题或主题摘要，用于增强回退图片 Alt 语义。"""
+    if not raw_page_text:
+        return ""
+    for raw_line in raw_page_text.splitlines():
+        clean = re.sub(r"\s+", " ", raw_line).strip()
+        if not clean or _PDF_PAGE_NUM_RE.match(clean):
+            continue
+        if len(clean) > max_len:
+            return clean[:max_len].rstrip() + "..."
+        return clean
+    return ""
+
+
+def _render_pdf_page_body(
+    raw_page_text: str,
+    inline_anchors: dict[int, list[str]],
+    trailing_anchors: list[str],
+) -> str:
+    """将已匹配图题的图片锚点就地插入对应图题行下方，其余图片锚点保留在页末。"""
+    parts: list[str] = []
+    if raw_page_text:
+        if inline_anchors:
+            lines = raw_page_text.splitlines()
+            rebuilt_lines: list[str] = []
+            for idx, line in enumerate(lines):
+                rebuilt_lines.append(line)
+                matched = inline_anchors.get(idx)
+                if matched:
+                    rebuilt_lines.append("")
+                    rebuilt_lines.extend(matched)
+                    rebuilt_lines.append("")
+            parts.append("\n".join(rebuilt_lines).strip())
+        else:
+            parts.append(raw_page_text)
+    if trailing_anchors:
+        parts.extend(trailing_anchors)
+    return "\n\n".join(part for part in parts if part)
+
+
 def _parse_pdf_page(
     page: Any,
     page_idx: int,
@@ -475,14 +563,25 @@ def _parse_pdf_page(
     *,
     extract_images: bool = True,
 ) -> str | None:
-    """提取单个 PDF 页面的正文文本与逐张隔离的合格图片锚点。"""
+    """提取单个 PDF 页面的正文文本、邻近图注 Alt 语义与就地排版图片锚点。"""
     try:
         raw_page_text = (page.extract_text() or "").replace("\r\n", "\n").strip()
     except Exception as exc:
         logger.warning("提取 PDF 第 %d 页文本失败 (%s): %s", page_idx, file_name, exc)
         raw_page_text = ""
 
-    page_anchors: list[str] = []
+    captions = _extract_pdf_page_captions(raw_page_text)
+    page_summary = _extract_pdf_page_summary(raw_page_text) if not captions else ""
+    fallback_alt = (
+        f"PDF 第 {page_idx} 页插图（{page_summary}）"
+        if page_summary
+        else f"PDF 第 {page_idx} 页插图"
+    )
+
+    inline_anchors: dict[int, list[str]] = {}
+    trailing_anchors: list[str] = []
+    caption_cursor = 0
+
     if extract_images:
         try:
             images_proxy = page.images
@@ -507,27 +606,40 @@ def _parse_pdf_page(
                 )
                 continue
 
+            if not raw_bytes:
+                continue
+
+            digest = hashlib.sha256(raw_bytes).hexdigest()
+            is_new_image = digest not in content_cache
+            matched_caption: _PdfCaption | None = None
+            if is_new_image and caption_cursor < len(captions):
+                matched_caption = captions[caption_cursor]
+                alt_hint = matched_caption.text
+            else:
+                alt_hint = fallback_alt
+
             stem_hint = Path(raw_name.replace("\\", "/")).stem or f"img_{img_idx + 1}"
             hint = f"page_{page_idx}_{stem_hint}"
             final_image = _register_unique_image(
                 raw_bytes,
                 filename_hint=hint,
-                alt_hint=f"PDF 第 {page_idx} 页插图",
+                alt_hint=alt_hint,
                 valid_images=valid_images,
                 used_lower_filenames=used_lower_filenames,
                 content_cache=content_cache,
             )
             if final_image is not None:
-                page_anchors.append(_format_markdown_anchor(kb_name, doc_key, final_image))
+                anchor = _format_markdown_anchor(kb_name, doc_key, final_image)
+                if matched_caption is not None:
+                    caption_cursor += 1
+                    inline_anchors.setdefault(matched_caption.line_idx, []).append(anchor)
+                else:
+                    trailing_anchors.append(anchor)
 
-    if not raw_page_text and not page_anchors:
+    body = _render_pdf_page_body(raw_page_text, inline_anchors, trailing_anchors)
+    if not body:
         return None
-    page_parts: list[str] = [f"## 第 {page_idx} 页"]
-    if raw_page_text:
-        page_parts.append(raw_page_text)
-    if page_anchors:
-        page_parts.extend(page_anchors)
-    return "\n\n".join(page_parts)
+    return f"## 第 {page_idx} 页\n\n{body}"
 
 
 def _parse_pdf_document(
