@@ -203,6 +203,15 @@ class Settings(BaseModel):
         default_factory=lambda: os.getenv("MCP_RAG_MILVUS_URI", "http://localhost:19530").strip()
     )
     milvus_token: str = Field(default_factory=lambda: os.getenv("MCP_RAG_MILVUS_TOKEN", "").strip())
+    milvus_collection: str = Field(
+        default_factory=lambda: os.getenv("MCP_RAG_MILVUS_COLLECTION", "").strip()
+    )
+    milvus_collection_prefix: str = Field(
+        default_factory=lambda: (
+            os.getenv("MCP_RAG_MILVUS_COLLECTION_PREFIX", "mcp_rag_chunks").strip()
+            or "mcp_rag_chunks"
+        )
+    )
     metadata_store: str = Field(
         default_factory=lambda: (
             os.getenv("MCP_RAG_METADATA_STORE", "sqlite").strip().lower() or "sqlite"

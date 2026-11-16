@@ -27,14 +27,15 @@ def get_vector_store(settings: Settings) -> VectorStoreAdapter:
     if store_type == "milvus":
         from mcp_server_rag.vector_store.milvus import MilvusVectorStoreAdapter
 
-        if settings.embedding_dimension is not None:
-            return MilvusVectorStoreAdapter(
-                uri=settings.milvus_uri,
-                token=settings.milvus_token,
-                dimension=settings.embedding_dimension,
-            )
         return MilvusVectorStoreAdapter(
             uri=settings.milvus_uri,
             token=settings.milvus_token,
+            collection_name=settings.milvus_collection or None,
+            collection_prefix=settings.milvus_collection_prefix,
+            dimension=(
+                settings.embedding_dimension
+                if settings.embedding_dimension is not None
+                else MilvusVectorStoreAdapter.DEFAULT_DIMENSION
+            ),
         )
     return ChromaVectorStoreAdapter(data_dir=settings.data_dir)

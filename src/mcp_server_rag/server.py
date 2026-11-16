@@ -363,8 +363,16 @@ def rag_create_kb(
             "message": f"Failed to register knowledge base '{name}' in metadata catalog",
         }
 
-    # 3. 在向量存储中初始化物理集合
-    vector_store.create_kb(name, dimension=target_dim)
+    # 3. 在向量存储中初始化物理集合（若集合维度冲突则回滚元数据注册）
+    try:
+        vector_store.create_kb(name, dimension=target_dim)
+    except ValueError as exc:
+        catalog.delete_kb(name)
+        return {
+            "success": False,
+            "name": name,
+            "message": str(exc),
+        }
 
     return {
         "success": True,
@@ -615,6 +623,24 @@ def rag_doctor() -> dict[str, Any]:
     storage_probe = _probe_storage_health(settings)
     storage_ok = storage_probe.get("storage_status") == "ok"
 
+    vector_store_error: str | None = None
+    vector_store_diag_fields: dict[str, Any] = {}
+    diagnoser = getattr(vector_store, "diagnose", None)
+    if vector_store_ok and callable(diagnoser):
+        try:
+            diag_result = diagnoser(embedding_dimension)
+            if isinstance(diag_result, dict):
+                details = diag_result.get("details")
+                if isinstance(details, dict):
+                    vector_store_diag_fields = details
+                if diag_result.get("compatible") is False:
+                    vector_store_ok = False
+                    vector_store_error = str(
+                        diag_result.get("error") or "向量存储集合维度与当前模型维度不一致"
+                    )
+        except Exception as exc:
+            logger.warning("rag_doctor 校验向量存储诊断状态失败: %s", exc)
+
     overall_status = (
         "healthy"
         if (sqlite_ok and vector_store_ok and embedding_status == "ok" and storage_ok)
@@ -628,6 +654,7 @@ def rag_doctor() -> dict[str, Any]:
         "disk_free_bytes": free,
         "vector_store": settings.vector_store,
         "vector_store_status": "ok" if vector_store_ok else "error",
+        **vector_store_diag_fields,
         "metadata_store": settings.metadata_store,
         "metadata_catalog_status": "ok" if sqlite_ok else "error",
         "embedding_provider": settings.embedding_provider,
@@ -644,6 +671,8 @@ def rag_doctor() -> dict[str, Any]:
         "knowledge_bases_count": kb_count,
         "documents_count": doc_count,
     }
+    if vector_store_error:
+        report["vector_store_error"] = vector_store_error
     if embedding_error:
         report["embedding_error"] = embedding_error
     return report
