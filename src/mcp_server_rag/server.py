@@ -52,6 +52,7 @@ from mcp_server_rag.parsers import (
     split_markdown,
 )
 from mcp_server_rag.reranker import RerankerProvider, get_reranker_provider
+from mcp_server_rag.s3_storage import build_s3_health_report, get_s3_storage_adapter
 from mcp_server_rag.splitter import recursive_split_text
 from mcp_server_rag.vector_store import VectorStoreAdapter, get_vector_store
 
@@ -537,6 +538,42 @@ def rag_delete_document(kb_name: str, doc_id: str) -> dict[str, Any]:
     }
 
 
+def _probe_storage_health(settings: Settings) -> dict[str, Any]:
+    """按当前 ``storage_type`` 探测图片资产存储后端连通性与存储桶可用性。"""
+    if settings.storage_type == "local":
+        return {"storage_status": "ok"}
+
+    if settings.storage_type != "s3":
+        return {
+            "storage_status": "error",
+            "storage_error": (
+                f"不支持的对象存储类型 '{settings.storage_type}'，可选值: local, s3"
+            ),
+        }
+
+    try:
+        adapter = get_s3_storage_adapter(settings)
+        return adapter.check_bucket_health()
+    except ValueError as exc:
+        logger.warning("rag_doctor 校验 S3 存储配置失败: %s", exc)
+        return build_s3_health_report(
+            bucket=settings.s3_bucket,
+            auto_create_bucket=settings.s3_auto_create_bucket,
+            storage_status="error",
+            s3_bucket_exists=False,
+            storage_error=str(exc),
+        )
+    except Exception as exc:
+        logger.warning("rag_doctor 探测 S3 对象存储失败: %s", exc)
+        return build_s3_health_report(
+            bucket=settings.s3_bucket,
+            auto_create_bucket=settings.s3_auto_create_bucket,
+            storage_status="error",
+            s3_bucket_exists=None,
+            storage_error=str(exc),
+        )
+
+
 def rag_doctor() -> dict[str, Any]:
     """全维自检诊断探针，检查存储引擎连通性、本地模型配置、磁盘占用与系统环境。
 
@@ -574,8 +611,13 @@ def rag_doctor() -> dict[str, Any]:
         embedding_status = "error"
         embedding_error = str(exc)
 
+    storage_probe = _probe_storage_health(settings)
+    storage_ok = storage_probe.get("storage_status") == "ok"
+
     overall_status = (
-        "healthy" if (sqlite_ok and vector_store_ok and embedding_status == "ok") else "degraded"
+        "healthy"
+        if (sqlite_ok and vector_store_ok and embedding_status == "ok" and storage_ok)
+        else "degraded"
     )
 
     report: dict[str, Any] = {
@@ -592,6 +634,7 @@ def rag_doctor() -> dict[str, Any]:
         "embedding_dimension": embedding_dimension,
         "embedding_status": embedding_status,
         "storage_type": settings.storage_type,
+        **storage_probe,
         "archive_remote_images": settings.archive_remote_images,
         "read_only": settings.read_only,
         "rerank_enabled": settings.rerank_enabled,

@@ -34,7 +34,7 @@ from mcp.server.mcpserver.exceptions import ResourceError, ResourceNotFoundError
 from mcp.types import BlobResourceContents, ReadResourceRequestParams
 from PIL import Image
 
-from mcp_server_rag.assets import make_asset_doc_key
+from mcp_server_rag.assets import ExtractedImage, make_asset_doc_key
 from mcp_server_rag.config import get_settings
 from mcp_server_rag.metadata import get_metadata_catalog
 from mcp_server_rag.remote_images import (
@@ -49,6 +49,7 @@ from mcp_server_rag.server import (
     rag_create_kb,
     rag_delete_document,
     rag_delete_kb,
+    rag_doctor,
     rag_index_file,
     rag_index_text,
     rag_index_url,
@@ -229,6 +230,7 @@ def isolated_gateway_env() -> Generator[Path, None, None]:
         "MCP_RAG_S3_PREFIX",
         "MCP_RAG_S3_PUBLIC_BASE_URL",
         "MCP_RAG_S3_TIMEOUT_SECONDS",
+        "MCP_RAG_S3_AUTO_CREATE_BUCKET",
         "MCP_RAG_ARCHIVE_REMOTE_IMAGES",
         "MCP_RAG_REMOTE_IMAGE_TIMEOUT_SECONDS",
         "MCP_RAG_REMOTE_IMAGE_MAX_BYTES",
@@ -783,3 +785,234 @@ async def test_archive_remote_images_enabled_filters_ssrf_and_archives_safe_urls
     assert ("archive-bucket", s3_obj_key) in fake_s3.objects
     s3_hits = rag_search(kb_name="archive_s3_kb", query="外链上云架构图", top_k=3)
     assert s3_hits[0]["metadata"]["images"] == [s3_cdn_url]
+
+
+class _FakeS3Error(Exception):
+    """模拟带有标准 boto3 response 元数据的 ClientError。"""
+
+    def __init__(self, code: str, status_code: int, message: str = "") -> None:
+        super().__init__(message or code)
+        self.response = {
+            "Error": {"Code": code, "Message": message or code},
+            "ResponseMetadata": {"HTTPStatusCode": status_code},
+        }
+
+
+class _ProbingFakeS3Client(FakeS3Client):
+    """支持 head_bucket 与 create_bucket 探测/建桶测试的 Fake S3 客户端。"""
+
+    def __init__(
+        self,
+        *,
+        existing_buckets: set[str] | None = None,
+        head_error: Exception | None = None,
+        create_error: Exception | None = None,
+    ) -> None:
+        super().__init__()
+        self.existing_buckets = set(existing_buckets or set())
+        self.head_error = head_error
+        self.create_error = create_error
+        self.head_calls: list[str] = []
+        self.create_calls: list[dict[str, Any]] = []
+
+    def head_bucket(self, **kwargs: Any) -> dict[str, Any]:
+        bucket = str(kwargs["Bucket"])
+        self.head_calls.append(bucket)
+        if self.head_error is not None:
+            raise self.head_error
+        if bucket not in self.existing_buckets:
+            raise _FakeS3Error("404", 404, "Not Found")
+        return {}
+
+    def create_bucket(self, **kwargs: Any) -> dict[str, Any]:
+        self.create_calls.append(dict(kwargs))
+        if self.create_error is not None:
+            raise self.create_error
+        self.existing_buckets.add(str(kwargs["Bucket"]))
+        return {}
+
+
+def test_s3_bucket_health_probe_and_auto_create_contract() -> None:
+    """验证 S3AssetStorageAdapter 存储桶连通性自检、异常分类与按需自动建桶契约。"""
+    # 1. 目标桶存在时返回健康状态
+    ok_client = _ProbingFakeS3Client(existing_buckets={"team-rag"})
+    ok_adapter = S3AssetStorageAdapter(bucket="team-rag", client=ok_client)
+    ok_health = ok_adapter.check_bucket_health()
+    assert ok_health["storage_status"] == "ok"
+    assert ok_health["s3_bucket"] == "team-rag"
+    assert ok_health["s3_bucket_exists"] is True
+    assert ok_health["s3_auto_create_bucket"] is False
+    assert "storage_error" not in ok_health
+
+    # 2. 目标桶不存在且未开启自动建桶时返回明确报错引导
+    missing_client = _ProbingFakeS3Client(existing_buckets=set())
+    missing_adapter = S3AssetStorageAdapter(
+        bucket="missing-bucket",
+        auto_create_bucket=False,
+        client=missing_client,
+    )
+    missing_health = missing_adapter.check_bucket_health()
+    assert missing_health["storage_status"] == "error"
+    assert missing_health["s3_bucket_exists"] is False
+    assert "missing-bucket" in missing_health["storage_error"]
+    assert "MCP_RAG_S3_AUTO_CREATE_BUCKET" in missing_health["storage_error"]
+    assert missing_client.create_calls == []
+
+    # 3. 开启 auto_create_bucket=True 时自动建桶（us-east-1 不传 LocationConstraint，其余区域传入）
+    us_client = _ProbingFakeS3Client(existing_buckets=set())
+    us_adapter = S3AssetStorageAdapter(
+        bucket="auto-us-bucket",
+        region_name="us-east-1",
+        auto_create_bucket=True,
+        client=us_client,
+    )
+    us_health = us_adapter.check_bucket_health()
+    assert us_health["storage_status"] == "ok"
+    assert us_health["s3_bucket_exists"] is True
+    assert us_health["s3_auto_create_bucket"] is True
+    assert us_client.create_calls == [{"Bucket": "auto-us-bucket"}]
+
+    cn_client = _ProbingFakeS3Client(existing_buckets=set())
+    cn_adapter = S3AssetStorageAdapter(
+        bucket="auto-cn-bucket",
+        region_name="cn-hangzhou",
+        auto_create_bucket=True,
+        client=cn_client,
+    )
+    cn_health = cn_adapter.check_bucket_health()
+    assert cn_health["storage_status"] == "ok"
+    assert cn_client.create_calls == [
+        {
+            "Bucket": "auto-cn-bucket",
+            "CreateBucketConfiguration": {"LocationConstraint": "cn-hangzhou"},
+        }
+    ]
+
+    # 4. 并发建桶返回 BucketAlreadyOwnedByYou 时保持幂等成功；
+    # BucketAlreadyExists（他人占用）必须报错
+    race_client = _ProbingFakeS3Client(
+        existing_buckets=set(),
+        create_error=_FakeS3Error("BucketAlreadyOwnedByYou", 409, "Already owned"),
+    )
+    race_adapter = S3AssetStorageAdapter(
+        bucket="race-bucket",
+        auto_create_bucket=True,
+        client=race_client,
+    )
+    assert race_adapter.check_bucket_health()["storage_status"] == "ok"
+
+    taken_client = _ProbingFakeS3Client(
+        existing_buckets=set(),
+        create_error=_FakeS3Error("BucketAlreadyExists", 409, "Bucket already exists"),
+    )
+    taken_adapter = S3AssetStorageAdapter(
+        bucket="taken-bucket",
+        auto_create_bucket=True,
+        client=taken_client,
+    )
+    taken_health = taken_adapter.check_bucket_health()
+    assert taken_health["storage_status"] == "error"
+    assert taken_health["s3_bucket_exists"] is False
+
+    # 5. 鉴权失败 (403) 或网络异常时 s3_bucket_exists 为 None 并返回清晰排查指引
+    auth_client = _ProbingFakeS3Client(head_error=_FakeS3Error("AccessDenied", 403, "Forbidden"))
+    auth_health = S3AssetStorageAdapter(
+        bucket="auth-bucket",
+        client=auth_client,
+    ).check_bucket_health()
+    assert auth_health["storage_status"] == "error"
+    assert auth_health["s3_bucket_exists"] is None
+    assert "鉴权" in auth_health["storage_error"] or "AccessDenied" in auth_health["storage_error"]
+
+    net_client = _ProbingFakeS3Client(head_error=ConnectionError("connection refused"))
+    net_health = S3AssetStorageAdapter(bucket="net-bucket", client=net_client).check_bucket_health()
+    assert net_health["storage_status"] == "error"
+    assert net_health["s3_bucket_exists"] is None
+    assert "connection refused" in net_health["storage_error"]
+
+    # 6. 开启 auto_create_bucket=True 时直接上传图片也能按需自动建桶
+    upload_client = _ProbingFakeS3Client(existing_buckets=set())
+    upload_adapter = S3AssetStorageAdapter(
+        bucket="lazy-upload-bucket",
+        auto_create_bucket=True,
+        client=upload_client,
+    )
+    png_data = _make_png_bytes(120, 120)
+    records, _ = upload_adapter.upload_image_assets(
+        "kb_auto",
+        "doc_auto",
+        [
+            ExtractedImage(
+                filename="fig1.png",
+                data=png_data,
+                mime_type="image/png",
+                alt="自动建桶图",
+                width=120,
+                height=120,
+                byte_size=len(png_data),
+            )
+        ],
+    )
+    assert len(records) == 1
+    assert "lazy-upload-bucket" in upload_client.existing_buckets
+    assert len(upload_client.create_calls) == 1
+
+
+def test_rag_doctor_s3_connectivity_and_auto_create_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2E: rag_doctor 在 S3 模式下校验连通性、桶存在性与按需自动建桶并准确反映健康度。"""
+    # 1. 本地存储模式默认健康
+    local_report = rag_doctor()
+    assert local_report["storage_type"] == "local"
+    assert local_report["storage_status"] == "ok"
+    assert local_report["status"] == "healthy"
+
+    # 2. S3 模式未配置 MCP_RAG_S3_BUCKET 时优雅降级
+    os.environ["MCP_RAG_STORAGE_TYPE"] = "s3"
+    os.environ.pop("MCP_RAG_S3_BUCKET", None)
+    no_bucket_report = rag_doctor()
+    assert no_bucket_report["storage_type"] == "s3"
+    assert no_bucket_report["storage_status"] == "error"
+    assert no_bucket_report["s3_bucket_exists"] is False
+    assert no_bucket_report["status"] == "degraded"
+    assert "MCP_RAG_S3_BUCKET" in no_bucket_report["storage_error"]
+
+    # 3. S3 模式缺少 boto3 依赖时优雅降级且返回安装提示
+    os.environ["MCP_RAG_S3_BUCKET"] = "doctor-bucket"
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    no_boto_report = rag_doctor()
+    assert no_boto_report["storage_status"] == "error"
+    assert no_boto_report["s3_bucket_exists"] is None
+    assert no_boto_report["status"] == "degraded"
+    assert "boto3" in no_boto_report["storage_error"]
+
+    # 4. 桶不存在且未启用自动建桶 -> degraded + 清晰建桶提示
+    probing_s3 = _ProbingFakeS3Client(existing_buckets=set())
+    _install_fake_boto3(monkeypatch, probing_s3)
+    missing_report = rag_doctor()
+    assert missing_report["storage_status"] == "error"
+    assert missing_report["s3_bucket"] == "doctor-bucket"
+    assert missing_report["s3_bucket_exists"] is False
+    assert missing_report["s3_auto_create_bucket"] is False
+    assert missing_report["status"] == "degraded"
+    assert "doctor-bucket" in missing_report["storage_error"]
+
+    # 5. 开启 MCP_RAG_S3_AUTO_CREATE_BUCKET=true -> 自动建桶并返回 healthy
+    os.environ["MCP_RAG_S3_AUTO_CREATE_BUCKET"] = "true"
+    auto_report = rag_doctor()
+    assert auto_report["storage_status"] == "ok"
+    assert auto_report["s3_bucket_exists"] is True
+    assert auto_report["s3_auto_create_bucket"] is True
+    assert auto_report["status"] == "healthy"
+    assert "storage_error" not in auto_report
+    assert "doctor-bucket" in probing_s3.existing_buckets
+
+    # 6. S3 鉴权失败 -> degraded + storage_error
+    os.environ["MCP_RAG_S3_AUTO_CREATE_BUCKET"] = "false"
+    probing_s3.head_error = _FakeS3Error("AccessDenied", 403, "Forbidden")
+    auth_report = rag_doctor()
+    assert auth_report["storage_status"] == "error"
+    assert auth_report["s3_bucket_exists"] is None
+    assert auth_report["status"] == "degraded"
+    assert "AccessDenied" in auth_report["storage_error"] or "鉴权" in auth_report["storage_error"]

@@ -465,3 +465,70 @@ def test_image_assets_lifecycle_and_cascading_delete(isolated_env: str) -> None:
             doc_id="doc_b",
             assets=[{"filename": "  ", "storage_uri": "images/x.png"}],
         )
+
+
+def test_database_url_userinfo_special_chars_and_invalid_dsn_guidance() -> None:
+    """验证 MCP_RAG_DATABASE_URL 密码含 @/#/? 等字符时自动安全编码，非法 DSN 给出纠错提示。"""
+    # 1. 密码包含未转义 @（按最后一个 @ 分隔认证段与主机段）
+    s_at = Settings(
+        metadata_store="postgresql",
+        database_url="postgresql://postgres:Admin@123@db.example.com:5432/rag_metadata",
+    )
+    assert (
+        s_at.resolved_database_url()
+        == "postgresql://postgres:Admin%40123@db.example.com:5432/rag_metadata"
+    )
+
+    # 2. 用户名含 @，密码含 @、:、#、? 与空格，同时保留查询参数
+    s_complex = Settings(
+        metadata_store="mysql",
+        database_url=(
+            "mysql://rag@corp:P@ss:w#rd?1 2"
+            "@mysql.internal.local:3307/team_rag?charset=utf8mb4"
+        ),
+    )
+    assert s_complex.resolved_database_url() == (
+        "mysql://rag%40corp:P%40ss%3Aw%23rd%3F1%202"
+        "@mysql.internal.local:3307/team_rag?charset=utf8mb4"
+    )
+
+    # 3. 已正确 URL 编码的密码保持幂等，不二次转义 %40 -> %2540
+    encoded_url = "postgresql://postgres:Admin%40123@db.example.com:5432/rag_metadata"
+    assert (
+        Settings(metadata_store="postgresql", database_url=encoded_url).resolved_database_url()
+        == encoded_url
+    )
+
+    # 4. sqlite:/// URL 保持原样
+    sqlite_url = "sqlite:///D:/data/rag/meta.db"
+    assert (
+        Settings(metadata_store="sqlite", database_url=sqlite_url).resolved_database_url()
+        == sqlite_url
+    )
+
+    # 5. 查询参数包含 @ 时仍正确识别真正的认证/主机分隔符，不截断主机名
+    s_query_at = Settings(
+        metadata_store="postgresql",
+        database_url=(
+            "postgresql://postgres:Admin@123@db.example.com:5432/rag_metadata"
+            "?email=ops@example.com"
+        ),
+    )
+    assert s_query_at.resolved_database_url() == (
+        "postgresql://postgres:Admin%40123@db.example.com:5432/rag_metadata"
+        "?email=ops@example.com"
+    )
+
+    # 6. 非法 DSN（如缺少主机名或非 IPv6 主机含多个冒号）抛出带配置建议的 ValueError
+    for bad_dsn in (
+        "postgresql://postgres:Admin@123@",
+        "postgresql://postgres:secret@a:b:5432/rag_metadata",
+    ):
+        with pytest.raises(ValueError) as bad_exc:
+            Settings(
+                metadata_store="postgresql",
+                database_url=bad_dsn,
+            ).resolved_database_url()
+        err_msg = str(bad_exc.value)
+        assert "MCP_RAG_DATABASE_URL" in err_msg
+        assert "MCP_RAG_DB_HOST" in err_msg

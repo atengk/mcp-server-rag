@@ -654,3 +654,44 @@ def test_server_e2e_postgres_and_mysql_backends(
         os.environ["MCP_RAG_DATABASE_URL"] = explicit_dsn
         catalog = get_metadata_catalog(get_settings())
         assert catalog.dsn == explicit_dsn  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("backend", ["postgresql", "mysql"])
+def test_database_url_special_password_reaches_postgres_and_mysql_drivers(
+    backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证含 @/# 等特殊字符的 MCP_RAG_DATABASE_URL 通过工厂注入后正确到达数据库驱动。"""
+    with closing(_FakeDBHarness()) as harness:
+        captured_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        def _spy_connect(*args: Any, **kwargs: Any) -> Any:
+            captured_calls.append((args, kwargs))
+            return harness.connect(*args, **kwargs)
+
+        fake_driver = SimpleNamespace(connect=_spy_connect)
+        driver_name = "psycopg" if backend == "postgresql" else "pymysql"
+        monkeypatch.setitem(sys.modules, driver_name, fake_driver)
+
+        default_port = 5432 if backend == "postgresql" else 3306
+        os.environ["MCP_RAG_METADATA_STORE"] = backend
+        os.environ["MCP_RAG_DATABASE_URL"] = (
+            f"{backend}://rag_admin:Admin@123#@db.example.com:{default_port}/rag_metadata"
+        )
+
+        catalog = get_metadata_catalog(get_settings())
+        assert catalog.ping() is True
+        assert captured_calls
+
+        args, kwargs = captured_calls[0]
+        if backend == "postgresql":
+            assert (
+                args[0]
+                == "postgresql://rag_admin:Admin%40123%23@db.example.com:5432/rag_metadata"
+            )
+        else:
+            assert kwargs["host"] == "db.example.com"
+            assert kwargs["port"] == 3306
+            assert kwargs["database"] == "rag_metadata"
+            assert kwargs["user"] == "rag_admin"
+            assert kwargs["password"] == "Admin@123#"

@@ -9,9 +9,106 @@
 
 import os
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from pydantic import BaseModel, Field
+
+
+def _split_host_and_suffix(host_and_suffix: str) -> tuple[str, str]:
+    """将 ``host[:port][/path][?query][#fragment]`` 拆分为主机端口段与后续路径段。"""
+    for idx, ch in enumerate(host_and_suffix):
+        if ch in "/?#":
+            return host_and_suffix[:idx], host_and_suffix[idx:]
+    return host_and_suffix, ""
+
+
+def _is_valid_host_port(host_port: str) -> bool:
+    """校验主机端口段格式合法性（支持 IPv4/域名与方括号包裹的 IPv6）。"""
+    if not host_port or "@" in host_port or any(ch.isspace() for ch in host_port):
+        return False
+
+    if host_port.startswith("["):
+        end_bracket = host_port.find("]")
+        if end_bracket <= 1:
+            return False
+        trailing = host_port[end_bracket + 1 :]
+        if not trailing:
+            return True
+        if not trailing.startswith(":"):
+            return False
+        port_str = trailing[1:]
+        return port_str.isdigit() and 1 <= int(port_str) <= 65535
+
+    if ":" in host_port:
+        host, port_str = host_port.rsplit(":", 1)
+        return bool(host) and ":" not in host and port_str.isdigit() and 1 <= int(port_str) <= 65535
+
+    return True
+
+
+def _normalize_database_url(raw_url: str) -> str:
+    """规范化 ``MCP_RAG_DATABASE_URL``，自动安全编码认证段特殊字符并校验基本结构。
+
+    当密码包含未转义 ``@``、``:``、``#``、``?`` 等字符时，结合主机端口与路径边界定位分隔认证段与
+    主机段的 ``@``，并对用户名与密码执行幂等 URL 编码（已编码的 ``%40`` 不会被二次转义）。
+    """
+    invalid_dsn_msg = (
+        "MCP_RAG_DATABASE_URL 格式无效：请检查连接串是否符合 "
+        "'scheme://user:password@host:port/dbname' 格式；若密码包含 @、:、#、? 等特殊字符，"
+        "请进行 URL 编码或改用 MCP_RAG_DB_HOST / MCP_RAG_DB_USER / "
+        "MCP_RAG_DB_PASSWORD 等拆分环境变量。"
+    )
+    if "://" not in raw_url:
+        raise ValueError(invalid_dsn_msg)
+
+    scheme, rest = raw_url.split("://", 1)
+    lower_scheme = scheme.strip().lower()
+    if not lower_scheme:
+        raise ValueError(invalid_dsn_msg)
+
+    # SQLite 本地文件连接串无需处理 userinfo
+    if lower_scheme == "sqlite" or lower_scheme.startswith("sqlite+"):
+        return raw_url
+
+    if "@" not in rest:
+        host_port, _ = _split_host_and_suffix(rest)
+        if not _is_valid_host_port(host_port):
+            raise ValueError(invalid_dsn_msg)
+        return raw_url
+
+    # 从左向右查找首个合法的认证/主机分隔符 `@`：
+    # 跳过 path 段含 `@` 或 `#`/`?` 后仍带有 `@.../path` 的候选位置（密码含 `#`/`?`/`/` 场景），
+    # 从而同时兼容密码含 `@/#/?` 与查询参数含 `@`（如 `?email=a@b.com`）。
+    selected_idx = -1
+    for idx, ch in enumerate(rest):
+        if ch != "@":
+            continue
+        candidate_right = rest[idx + 1 :]
+        host_port, suffix = _split_host_and_suffix(candidate_right)
+        if not _is_valid_host_port(host_port):
+            continue
+        path_part = suffix.split("?", 1)[0].split("#", 1)[0]
+        if "@" in path_part:
+            continue
+        if suffix.startswith(("?", "#")) and "@" in suffix and "/" in suffix.split("@", 1)[1]:
+            continue
+        selected_idx = idx
+        break
+
+    if selected_idx == -1:
+        raise ValueError(invalid_dsn_msg)
+
+    userinfo = rest[:selected_idx]
+    host_and_suffix = rest[selected_idx + 1 :]
+    if ":" in userinfo:
+        user_part, password_part = userinfo.split(":", 1)
+        encoded_user = quote(unquote(user_part), safe="")
+        encoded_password = quote(unquote(password_part), safe="")
+        encoded_userinfo = f"{encoded_user}:{encoded_password}"
+    else:
+        encoded_userinfo = quote(unquote(userinfo), safe="")
+
+    return f"{scheme}://{encoded_userinfo}@{host_and_suffix}"
 
 
 def _parse_int_env(key: str, default: int, min_val: int = 1) -> int:
@@ -127,6 +224,9 @@ class Settings(BaseModel):
     s3_timeout_seconds: int = Field(
         default_factory=lambda: _parse_int_env("MCP_RAG_S3_TIMEOUT_SECONDS", 30, min_val=1)
     )
+    s3_auto_create_bucket: bool = Field(
+        default_factory=lambda: _parse_bool_env("MCP_RAG_S3_AUTO_CREATE_BUCKET", False)
+    )
     archive_remote_images: bool = Field(
         default_factory=lambda: _parse_bool_env("MCP_RAG_ARCHIVE_REMOTE_IMAGES", False)
     )
@@ -171,7 +271,7 @@ class Settings(BaseModel):
             数据库连接 URL 字符串；若未配置外部连接信息且使用内置 SQLite，则返回默认本地路径连接串。
         """
         if self.database_url:
-            return self.database_url
+            return _normalize_database_url(self.database_url)
 
         if self.metadata_store == "sqlite":
             if not self.db_name:

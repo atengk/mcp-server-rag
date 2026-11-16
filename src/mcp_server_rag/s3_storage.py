@@ -34,6 +34,39 @@ def _load_boto3() -> Any:
         ) from exc
 
 
+def _extract_s3_error_info(exc: Exception) -> tuple[str, int | None]:
+    """从 boto3 ClientError 等异常中提取标准错误码与 HTTP 状态码。"""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return "", None
+    error_info = response.get("Error")
+    error_code = str(error_info.get("Code", "")) if isinstance(error_info, dict) else ""
+    meta_info = response.get("ResponseMetadata")
+    raw_status = meta_info.get("HTTPStatusCode") if isinstance(meta_info, dict) else None
+    http_status = int(raw_status) if isinstance(raw_status, int) else None
+    return error_code, http_status
+
+
+def build_s3_health_report(
+    *,
+    bucket: str,
+    auto_create_bucket: bool,
+    storage_status: str = "ok",
+    s3_bucket_exists: bool | None = True,
+    storage_error: str | None = None,
+) -> dict[str, Any]:
+    """构造统一的 S3 存储健康诊断报告字典。"""
+    report: dict[str, Any] = {
+        "storage_status": storage_status,
+        "s3_bucket": bucket,
+        "s3_bucket_exists": s3_bucket_exists,
+        "s3_auto_create_bucket": auto_create_bucket,
+    }
+    if storage_error:
+        report["storage_error"] = storage_error
+    return report
+
+
 class S3AssetStorageAdapter:
     """面向 S3 / MinIO / OSS 协议兼容对象存储的图片资产网关适配器。"""
 
@@ -48,6 +81,7 @@ class S3AssetStorageAdapter:
         prefix: str = "assets",
         public_base_url: str = "",
         timeout_seconds: int = 30,
+        auto_create_bucket: bool = False,
         client: Any | None = None,
     ) -> None:
         """初始化对象存储适配器并构造或绑定 S3 客户端。
@@ -61,6 +95,7 @@ class S3AssetStorageAdapter:
             prefix: 存储桶内部路径前缀，默认 ``assets``。
             public_base_url: 对外暴露的公共/CDN/HTTPS 基础直链前缀（可选）。
             timeout_seconds: 网络连接与读取超时秒数，必须 >= 1。
+            auto_create_bucket: 目标存储桶不存在时是否按需自动创建（默认 ``False``）。
             client: 可选注入的兼容 boto3 S3 client 实例（主要用于测试或自定义装配）。
 
         Raises:
@@ -81,6 +116,8 @@ class S3AssetStorageAdapter:
         self.prefix = prefix.strip().strip("/")
         self.public_base_url = public_base_url.strip().rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.auto_create_bucket = auto_create_bucket
+        self._bucket_ensured = False
         self._client = client if client is not None else self._create_boto3_client()
 
     @classmethod
@@ -100,6 +137,7 @@ class S3AssetStorageAdapter:
             prefix=settings.s3_prefix,
             public_base_url=settings.s3_public_base_url,
             timeout_seconds=settings.s3_timeout_seconds,
+            auto_create_bucket=settings.s3_auto_create_bucket,
             client=client,
         )
 
@@ -202,9 +240,7 @@ class S3AssetStorageAdapter:
         try:
             response = self._client.get_object(Bucket=target_bucket, Key=target_key)
         except Exception as exc:
-            error_code = ""
-            if hasattr(exc, "response") and isinstance(getattr(exc, "response"), dict):
-                error_code = str(exc.response.get("Error", {}).get("Code", ""))
+            error_code, _ = _extract_s3_error_info(exc)
             if error_code in {"NoSuchKey", "404", "NotFound"}:
                 raise FileNotFoundError(
                     f"S3 图片资产对象不存在 (s3://{target_bucket}/{target_key})"
@@ -257,6 +293,107 @@ class S3AssetStorageAdapter:
         if stale:
             self.delete_assets(stale)
 
+    def _create_bucket(self) -> None:
+        """按区域策略幂等创建目标 S3 存储桶。"""
+        create_kwargs: dict[str, Any] = {"Bucket": self.bucket}
+        if self.region_name and self.region_name != "us-east-1":
+            create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": self.region_name}
+        try:
+            self._client.create_bucket(**create_kwargs)
+        except Exception as exc:
+            error_code, _ = _extract_s3_error_info(exc)
+            # 仅 BucketAlreadyOwnedByYou 属于当前账号幂等成功；
+            # BucketAlreadyExists 代表桶名被他人占用，必须向外抛出异常
+            if error_code != "BucketAlreadyOwnedByYou":
+                raise
+
+    def check_bucket_health(self, *, auto_create: bool | None = None) -> dict[str, Any]:
+        """校验 S3 连通性、鉴权与目标存储桶存在性，并在启用时按需建桶。
+
+        Args:
+            auto_create: 显式覆盖建桶策略；为 ``None`` 时回退至实例的 ``auto_create_bucket``。
+
+        Returns:
+            包含 ``storage_status``（``"ok"`` / ``"error"``）、``s3_bucket``、
+            ``s3_bucket_exists``（``True``/``False``，鉴权或网络异常时为 ``None``）、
+            ``s3_auto_create_bucket`` 及可选 ``storage_error`` 的诊断字典。
+        """
+        should_auto_create = self.auto_create_bucket if auto_create is None else auto_create
+        try:
+            self._client.head_bucket(Bucket=self.bucket)
+            self._bucket_ensured = True
+            return build_s3_health_report(
+                bucket=self.bucket,
+                auto_create_bucket=should_auto_create,
+            )
+        except Exception as exc:
+            error_code, http_status = _extract_s3_error_info(exc)
+            is_missing = error_code in {"404", "NoSuchBucket", "NotFound"} or http_status == 404
+            if is_missing:
+                if should_auto_create:
+                    try:
+                        self._create_bucket()
+                        self._bucket_ensured = True
+                        logger.info("已自动创建缺失的 S3 存储桶: %s", self.bucket)
+                        return build_s3_health_report(
+                            bucket=self.bucket,
+                            auto_create_bucket=should_auto_create,
+                        )
+                    except Exception as create_exc:
+                        return build_s3_health_report(
+                            bucket=self.bucket,
+                            auto_create_bucket=should_auto_create,
+                            storage_status="error",
+                            s3_bucket_exists=False,
+                            storage_error=f"自动创建 S3 存储桶 '{self.bucket}' 失败: {create_exc}",
+                        )
+                return build_s3_health_report(
+                    bucket=self.bucket,
+                    auto_create_bucket=should_auto_create,
+                    storage_status="error",
+                    s3_bucket_exists=False,
+                    storage_error=(
+                        f"S3 存储桶 '{self.bucket}' 不存在，请预先创建该存储桶"
+                        "或设置 MCP_RAG_S3_AUTO_CREATE_BUCKET=true 按需自动创建。"
+                    ),
+                )
+
+            is_auth_error = error_code in {
+                "403",
+                "AccessDenied",
+                "InvalidAccessKeyId",
+                "SignatureDoesNotMatch",
+                "Forbidden",
+            } or http_status in {401, 403}
+            if is_auth_error:
+                return build_s3_health_report(
+                    bucket=self.bucket,
+                    auto_create_bucket=should_auto_create,
+                    storage_status="error",
+                    s3_bucket_exists=None,
+                    storage_error=(
+                        f"S3 鉴权或访问被拒绝 (bucket={self.bucket}, "
+                        f"code={error_code or http_status})："
+                        "请检查 MCP_RAG_S3_ACCESS_KEY、MCP_RAG_S3_SECRET_KEY 与存储桶访问权限。"
+                    ),
+                )
+
+            return build_s3_health_report(
+                bucket=self.bucket,
+                auto_create_bucket=should_auto_create,
+                storage_status="error",
+                s3_bucket_exists=None,
+                storage_error=f"S3 连通性检查失败 (bucket={self.bucket}): {exc}",
+            )
+
+    def ensure_bucket_exists(self) -> None:
+        """确保目标 S3 存储桶已就绪；不可达或未建桶时抛出明确异常。"""
+        if self._bucket_ensured:
+            return
+        report = self.check_bucket_health()
+        if report["storage_status"] != "ok":
+            raise RuntimeError(str(report.get("storage_error") or "S3 存储桶不可用"))
+
     def upload_image_assets(
         self,
         kb_name: str,
@@ -277,6 +414,9 @@ class S3AssetStorageAdapter:
         """
         if not images:
             return [], {}
+
+        if self.auto_create_bucket:
+            self.ensure_bucket_exists()
 
         safe_kb = validate_asset_segment(kb_name, "kb_name")
         doc_key = make_asset_doc_key(doc_id)
