@@ -72,7 +72,7 @@ def _load_pil_image_module() -> Any:
     except ImportError as exc:
         raise ImportError(
             "未检测到 Pillow 依赖，无法解码并校验图片资产。"
-            "请运行 `pip install pillow>=10.0.0` 或 `pip install atengk-mcp-server-rag[office]`。"
+            "请运行 `pip install pillow>=10.0.0` 或 `pip install ateng-mcp-server-rag[office]`。"
         ) from exc
 
 

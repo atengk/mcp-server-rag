@@ -11,11 +11,11 @@
   <a href="https://github.com/atengk/mcp-server-rag/releases">
     <img src="https://img.shields.io/github/v/release/atengk/mcp-server-rag?style=flat-square" alt="Release" />
   </a>
-  <a href="https://pypi.org/project/atengk-mcp-server-rag/">
-    <img src="https://img.shields.io/pypi/v/atengk-mcp-server-rag?style=flat-square&color=blue" alt="PyPI" />
+  <a href="https://pypi.org/project/ateng-mcp-server-rag/">
+    <img src="https://img.shields.io/pypi/v/ateng-mcp-server-rag?style=flat-square&color=blue" alt="PyPI" />
   </a>
-  <a href="https://pypi.org/project/atengk-mcp-server-rag/">
-    <img src="https://img.shields.io/pypi/pyversions/atengk-mcp-server-rag?style=flat-square" alt="Python Versions" />
+  <a href="https://pypi.org/project/ateng-mcp-server-rag/">
+    <img src="https://img.shields.io/pypi/pyversions/ateng-mcp-server-rag?style=flat-square" alt="Python Versions" />
   </a>
   <a href="./LICENSE">
     <img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg?style=flat-square" alt="License" />
@@ -134,17 +134,17 @@ flowchart TD
 无需预先安装 Python 依赖，直接通过 `uvx` 即开即用：
 
 ```bash
-uvx atengk-mcp-server-rag
+uvx ateng-mcp-server-rag
 ```
 
 若需包含可选企业级扩展（如 Milvus、Office/PDF、Postgres、MySQL、S3 支持）：
 
 ```bash
 # 包含所有可选驱动扩展
-uvx "atengk-mcp-server-rag[all]"
+uvx "ateng-mcp-server-rag[all]"
 
 # 或仅引入指定驱动扩展（如 office 与 s3）
-uvx "atengk-mcp-server-rag[office,s3]"
+uvx "ateng-mcp-server-rag[office,s3]"
 ```
 
 ### 方式二：使用 Docker 容器运行
@@ -192,7 +192,7 @@ uv run mcp-server-rag
   "mcpServers": {
     "rag": {
       "command": "uvx",
-      "args": ["atengk-mcp-server-rag"]
+      "args": ["ateng-mcp-server-rag"]
     }
   }
 }
@@ -226,7 +226,7 @@ uv run mcp-server-rag
   "mcpServers": {
     "rag": {
       "command": "uvx",
-      "args": ["atengk-mcp-server-rag"],
+      "args": ["ateng-mcp-server-rag"],
       "env": {
         "MCP_RAG_EMBEDDING_PROVIDER": "qwen",
         "MCP_RAG_EMBEDDING_MODEL": "text-embedding-v3",
@@ -250,7 +250,7 @@ uv run mcp-server-rag
   "mcpServers": {
     "rag": {
       "command": "uvx",
-      "args": ["atengk-mcp-server-rag[all]"],
+      "args": ["ateng-mcp-server-rag[all]"],
       "env": {
         "MCP_RAG_VECTOR_STORE": "milvus",
         "MCP_RAG_MILVUS_URI": "http://10.0.0.10:19530",
@@ -284,7 +284,7 @@ uv run mcp-server-rag
   "mcpServers": {
     "rag": {
       "command": "uvx",
-      "args": ["atengk-mcp-server-rag"],
+      "args": ["ateng-mcp-server-rag"],
       "env": {
         "MCP_RAG_READ_ONLY": "true"
       }

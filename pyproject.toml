@@ -1,6 +1,6 @@
 [project]
-name = "atengk-mcp-server-rag"
-version = "0.1.0"
+name = "ateng-mcp-server-rag"
+version = "1.0.0"
 description = "基于 Python 与 FastMCP 构建的高性能检索增强生成 (RAG) 模型上下文协议 (MCP) 服务，为大语言模型提供知识库检索与上下文增强能力。"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -80,7 +80,7 @@ dev = [
 ]
 
 [project.scripts]
-atengk-mcp-server-rag = "mcp_server_rag:main"
+ateng-mcp-server-rag = "mcp_server_rag:main"
 mcp-server-rag = "mcp_server_rag:main"
 
 [build-system]

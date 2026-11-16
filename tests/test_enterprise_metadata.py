@@ -94,7 +94,7 @@ def test_missing_driver_raises_informative_import_error(
     with pytest.raises(ImportError) as pg_exc:
         PostgresMetadataCatalog(dsn="postgresql://rag:secret@localhost:5432/rag_db")
     pg_msg = str(pg_exc.value)
-    assert "atengk-mcp-server-rag[postgres]" in pg_msg
+    assert "ateng-mcp-server-rag[postgres]" in pg_msg
     assert "psycopg" in pg_msg
 
     with pytest.raises(ImportError) as factory_pg_exc:
@@ -102,13 +102,13 @@ def test_missing_driver_raises_informative_import_error(
         os.environ["MCP_RAG_DB_HOST"] = "pg.local"
         os.environ["MCP_RAG_DB_NAME"] = "team_rag"
         get_metadata_catalog(get_settings())
-    assert "atengk-mcp-server-rag[postgres]" in str(factory_pg_exc.value)
+    assert "ateng-mcp-server-rag[postgres]" in str(factory_pg_exc.value)
 
     monkeypatch.setitem(sys.modules, "pymysql", None)
     with pytest.raises(ImportError) as mysql_exc:
         MySQLMetadataCatalog(dsn="mysql://rag:secret@localhost:3306/rag_db")
     mysql_msg = str(mysql_exc.value)
-    assert "atengk-mcp-server-rag[mysql]" in mysql_msg
+    assert "ateng-mcp-server-rag[mysql]" in mysql_msg
     assert "pymysql" in mysql_msg
 
     with pytest.raises(ImportError) as factory_mysql_exc:
@@ -118,7 +118,7 @@ def test_missing_driver_raises_informative_import_error(
                 database_url="mysql://rag:secret@mysql.local:3306/team_rag",
             )
         )
-    assert "atengk-mcp-server-rag[mysql]" in str(factory_mysql_exc.value)
+    assert "ateng-mcp-server-rag[mysql]" in str(factory_mysql_exc.value)
 
     # 额外校验：pyproject.toml 声明了轻量可选依赖组 postgres 与 mysql
     pyproject_text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text("utf-8")

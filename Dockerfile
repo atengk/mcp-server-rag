@@ -32,7 +32,7 @@ ENV PYTHONUNBUFFERED=1
 # 从构建阶段复制已安装的包与二进制命令
 COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
 COPY --from=builder /usr/local/bin/mcp-server-rag /usr/local/bin/mcp-server-rag
-COPY --from=builder /usr/local/bin/atengk-mcp-server-rag /usr/local/bin/atengk-mcp-server-rag
+COPY --from=builder /usr/local/bin/ateng-mcp-server-rag /usr/local/bin/ateng-mcp-server-rag
 
 # 创建非 root 安全运行用户
 RUN useradd -u 10001 -m appuser && chown -R appuser:appuser /app

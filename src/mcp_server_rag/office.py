@@ -93,7 +93,7 @@ def _load_pypdf() -> Any:
     except ImportError as exc:
         raise ImportError(
             "未检测到 pypdf 依赖，无法解析 PDF 文档。"
-            "请运行 `pip install atengk-mcp-server-rag[office]` "
+            "请运行 `pip install ateng-mcp-server-rag[office]` "
             '或 `uv pip install "pypdf>=4.0.0"` 进行安装。'
         ) from exc
 
@@ -105,7 +105,7 @@ def _load_python_docx() -> Any:
     except ImportError as exc:
         raise ImportError(
             "未检测到 python-docx 依赖，无法解析 Word (.docx) 文档。"
-            "请运行 `pip install atengk-mcp-server-rag[office]` "
+            "请运行 `pip install ateng-mcp-server-rag[office]` "
             '或 `uv pip install "python-docx>=1.1.0"` 进行安装。'
         ) from exc
 

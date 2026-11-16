@@ -11,7 +11,7 @@ from mcp_server_rag.server import health_check, mcp
 
 def test_version() -> None:
     """验证版本号导出正常。"""
-    assert __version__ == "0.1.0"
+    assert __version__ == "1.0.0"
 
 
 def test_mcp_instance_initialized() -> None:
@@ -24,4 +24,4 @@ def test_health_check() -> None:
     result = health_check()
     assert result["status"] == "healthy"
     assert result["service"] == "mcp-server-rag"
-    assert result["version"] == "0.1.0"
+    assert result["version"] == "1.0.0"

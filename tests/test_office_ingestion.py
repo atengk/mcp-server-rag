@@ -98,13 +98,13 @@ def test_office_extra_declared_and_missing_dependency_errors(
     with pytest.raises(ImportError) as pdf_exc:
         rag_index_file(kb_name="office_dep_kb", file_path=str(pdf_file))
     pdf_msg = str(pdf_exc.value)
-    assert "atengk-mcp-server-rag[office]" in pdf_msg
+    assert "ateng-mcp-server-rag[office]" in pdf_msg
     assert "pypdf" in pdf_msg
 
     with pytest.raises(ImportError) as docx_exc:
         rag_index_file(kb_name="office_dep_kb", file_path=str(docx_file))
     docx_msg = str(docx_exc.value)
-    assert "atengk-mcp-server-rag[office]" in docx_msg
+    assert "ateng-mcp-server-rag[office]" in docx_msg
     assert "python-docx" in docx_msg
 
     # 文本格式与目录中的文本文件不受 [office] 缺失影响
@@ -120,7 +120,7 @@ def test_office_extra_declared_and_missing_dependency_errors(
     assert dir_res["failed_count"] == 2
     failed_reports = [item for item in dir_res["files"] if item["status"] == "failed"]
     assert len(failed_reports) == 2
-    assert all("atengk-mcp-server-rag[office]" in item["message"] for item in failed_reports)
+    assert all("ateng-mcp-server-rag[office]" in item["message"] for item in failed_reports)
 
 
 def _make_png_bytes(width: int, height: int, noisy: bool = True) -> bytes:

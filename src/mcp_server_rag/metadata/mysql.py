@@ -27,7 +27,7 @@ def _load_pymysql() -> Any:
     except ImportError as exc:
         raise ImportError(
             "未检测到 pymysql 依赖，无法使用 MySQL 元数据目录。"
-            "请运行 `pip install atengk-mcp-server-rag[mysql]` "
+            "请运行 `pip install ateng-mcp-server-rag[mysql]` "
             '或 `uv pip install "pymysql>=1.1.0"` 进行安装。'
         ) from exc
 

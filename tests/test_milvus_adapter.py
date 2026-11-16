@@ -93,7 +93,7 @@ def test_milvus_missing_dependency_informative_error() -> None:
             adapter = MilvusVectorStoreAdapter(uri="http://localhost:19530")
             adapter._get_client()
         error_msg = str(exc_info.value)
-        assert "atengk-mcp-server-rag[milvus]" in error_msg
+        assert "ateng-mcp-server-rag[milvus]" in error_msg
         assert "pymilvus" in error_msg
 
 

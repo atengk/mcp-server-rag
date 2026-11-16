@@ -57,7 +57,7 @@ class MilvusVectorStoreAdapter:
         except ImportError as exc:
             raise ImportError(
                 "未检测到 pymilvus 依赖，无法使用 Milvus 向量存储。"
-                "请运行 `pip install atengk-mcp-server-rag[milvus]` "
+                "请运行 `pip install ateng-mcp-server-rag[milvus]` "
                 "或 `uv pip install pymilvus` 进行安装。"
             ) from exc
         self._client_instance = MilvusClient(uri=self.uri, token=self.token)

@@ -338,8 +338,8 @@ wheels = [
 ]
 
 [[package]]
-name = "atengk-mcp-server-rag"
-version = "0.1.0"
+name = "ateng-mcp-server-rag"
+version = "1.0.0"
 source = { editable = "." }
 dependencies = [
     { name = "chromadb" },

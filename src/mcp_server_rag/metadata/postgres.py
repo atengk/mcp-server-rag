@@ -26,7 +26,7 @@ def _load_psycopg() -> Any:
     except ImportError as exc:
         raise ImportError(
             "未检测到 psycopg 依赖，无法使用 PostgreSQL 元数据目录。"
-            "请运行 `pip install atengk-mcp-server-rag[postgres]` "
+            "请运行 `pip install ateng-mcp-server-rag[postgres]` "
             '或 `uv pip install "psycopg[binary]>=3.1.0"` 进行安装。'
         ) from exc
 

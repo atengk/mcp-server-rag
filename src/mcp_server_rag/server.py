@@ -278,7 +278,7 @@ def health_check() -> dict[str, str]:
     return {
         "status": "healthy",
         "service": "mcp-server-rag",
-        "version": "0.1.0",
+        "version": "1.0.0",
     }
 
 
@@ -1457,7 +1457,7 @@ def rag_index_url(
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Antigravity-RAG/0.1.0"
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Antigravity-RAG/1.0.0"
         )
     }
     try:

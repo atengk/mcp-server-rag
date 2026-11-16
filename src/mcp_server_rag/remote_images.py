@@ -210,7 +210,7 @@ def download_safe_remote_image(
         client_kwargs["transport"] = transport
 
     headers = {
-        "User-Agent": "Antigravity-RAG/0.1.0 (+image-archive)",
+        "User-Agent": "Antigravity-RAG/1.0.0 (+image-archive)",
         "Accept": "image/*,*/*;q=0.8",
     }
 

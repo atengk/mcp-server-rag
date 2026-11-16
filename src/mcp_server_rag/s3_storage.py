@@ -30,7 +30,7 @@ def _load_boto3() -> Any:
     except ImportError as exc:
         raise ImportError(
             "使用 S3/MinIO/OSS 对象存储网关 (MCP_RAG_STORAGE_TYPE=s3) 需要可选依赖 `[s3]`。"
-            '请运行 `pip install atengk-mcp-server-rag[s3]` 或 `uv pip install "boto3>=1.34.0"`。'
+            '请运行 `pip install ateng-mcp-server-rag[s3]` 或 `uv pip install "boto3>=1.34.0"`。'
         ) from exc
 
 
