@@ -70,15 +70,47 @@ _Avoid_: Cutoff, Min Score, Filter Level, 最低分
 将检索出的关联 Chunk 按带来源引用的 Markdown 结构化模板组装并注入大模型上下文的增强过程。
 _Avoid_: Prompt Stuffing, Text Appending, Context Merging, 提示词拼接
 
-### 存储架构与中间件约束 (Storage & Zero-Middleware Invariant)
+**FTS-Vector Hybrid Search (原生全文-向量混合检索)**:
+结合底层关系库（SQLite FTS5 / PG tsvector / MySQL FULLTEXT）的 BM25 关键词倒排索引与高维向量语义相似度，通过 RRF（Reciprocal Rank Fusion）倒数排名融合的高精度复合检索机制。
+_Avoid_: Dual Search, Mixed Query, 简单字符串正则包含
 
-**Zero-Middleware Architecture (零中间件自闭环架构)**:
-坚决杜绝强制引入 MySQL、Redis 等外部重型中间件，元数据与向量索引全部收敛于本地嵌入式存储（或可选远程 Milvus），确保 MCP 工具秒级自足运行。
-_Avoid_: MySQL Backend, Redis Cache, 外部中间件强绑定
+**Neighboring Context Window (邻近切片展开窗口)**:
+切片通过双向链表记录前后相邻关系（`prev_chunk_id` / `next_chunk_id`），在检索命中时根据 `expand_context` 参数按需将前后切片动态缝合输出的上下文完整性机制。
+_Avoid_: Parent Chunk, Chunk Merge, 大切片静态冗余
+
+### 存储架构与中间件约束 (Storage & Multi-Mode Deployment)
+
+**Dual-Mode Architecture (个人/团队双模架构)**:
+系统支持单机自闭环（个人模式）与集群分布式（团队模式）平滑切换：
+- **个人模式（默认）**：本地内嵌 SQLite + ChromaDB，零外部中间件，秒级启动开箱即用；
+- **团队模式**：支持外部关系型数据库（PostgreSQL / MySQL）+ 分布式向量库（Milvus）+ 对象存储（S3/MinIO），支撑多实例并发与团队资产协同共享。
+_Avoid_: Single-User Only, Cloud-Only, 强依赖特定部署形态
 
 **Metadata Catalog (元数据目录库)**:
-用于持久化记录知识库列表、文档指纹、切片统计与时间戳的轻量关系型存储（默认基于 Python 内建 SQLite，零外部依赖）。
-_Avoid_: JSON State, Flat File, MySQL
+用于持久化记录知识库列表、文档指纹、切片统计与访问可见性的关系型存储（单机默认内置 SQLite，团队模式支持通过独立环境变量接入 PostgreSQL 或 MySQL）。
+_Avoid_: JSON State, Flat File, 单一不可配置存储
+
+### 多模态与多端协同 (Multimodal & Team Collaboration)
+
+**Image Asset (图片资产)**:
+文档内嵌或引用的本地与远程图片实体，切片管道保护其语法原子性，提取 `alt` 文本注入向量语义，并在元数据中输出结构化定位引用。
+_Avoid_: Media File, Attachment, 附件
+
+**MCP Resource Gateway (MCP 资源网关)**:
+通过 Model Context Protocol 标准 `resources` 协议（如 `rag://assets/{kb_name}/{doc_id}/{filename}`）透出图片二进制流与原始内容，免去额外开放 HTTP 端口即可供团队多端客户端/Agent 直接拉取。
+_Avoid_: Static File Server, HTTP Webview, 内置 Web 服务器
+
+**Object Storage Gateway (对象存储网关)**:
+用于在企业团队共享模式下集中持久化托管多模态图片资产的 S3 / MinIO / OSS 兼容适配接口。
+_Avoid_: NAS Folder, FTP, 共享盘挂载
+
+**In-document Image Anchor (内嵌图片打桩)**:
+从 PDF/Word 二进制文件中解包提取有效插图并转存为资产实体后，在解析正文对应位置就地打入标准 Markdown 图片语法以实现统一图文流降维的机制。
+_Avoid_: Attachment List, Raw Binary Ingestion, 独立附件
+
+**Image Noise Filter (图片噪点门禁)**:
+在提取内嵌或外链图片时，基于物理尺寸（< 100 像素）与文件字节阈值（< 5 KB）自动过滤装饰性小图标、Logo 与分割线的清洗门禁。
+_Avoid_: Unfiltered Ingestion, Vision Cleanup, 全量粗暴提取
 
 ### 运维与环境安全 (Operations & Security)
 
